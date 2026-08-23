@@ -1,12 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod autostart;
 mod capture;
 mod config;
+mod dxgi_capture;
 mod hotkey;
 mod overlay;
+mod pdf_export;
 mod tray;
+mod video;
 
 use app::ShotgunApp;
 use eframe::NativeOptions;

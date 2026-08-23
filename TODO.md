@@ -1,6 +1,6 @@
 # 📝 shotGun - TODO & Roadmap
 
-## 🎯 v0.2.0 (Current Release - Completed)
+## 🎯 v0.2.0 (Completed)
 - [x] **Page 0 / 0-Indexed Support**: Allow starting counter at `0` (e.g. `shot_000.png` for cover pages/prefaces) or `1`.
 - [x] **Interactive Session Reset Dialog**: Prompt modal to confirm/edit destination path, session name, file prefix, and starting number on session reset.
 - [x] **System Tray Integration**: Minimize to tray with custom icon and context menu (*Show/Hide*, *Capture*, *New Session*, *Exit*).
@@ -14,11 +14,23 @@
 
 ---
 
-## 🚀 v0.3.0 (Near-term Roadmap)
-- [ ] **Video Recording (MP4)**: Continuous frame grab from selected ROI (DXGI / Windows Graphics Capture) encoded to H.264 MP4.
-- [ ] **Desktop Audio Capture (WASAPI Loopback)**: Capture system and application audio playing in the background, muxed into the video recording.
-- [ ] **Recording HUD**: Pulsating red ROI border overlay + recording timer pill (`REC 00:01:24`).
+## 🚀 v0.3.0 (Current Release - Completed)
+- [x] **Video Recording (MP4)**: Continuous ROI capture via direct DXGI Desktop Duplication (`src/dxgi_capture.rs`), correctly multi-adapter-aware (works on hybrid-GPU laptops where a monitor isn't on the "default" adapter). Async PNG-encoder worker pool decouples capture from disk/CPU encode time. Real per-frame durations (not an averaged framerate) muxed via an ffmpeg concat script, resampled to a constant output fps.
+- [x] **Desktop Audio Capture (WASAPI Loopback)**: `src/audio.rs` captures system audio directly via WASAPI (bypassing `cpal`, which doesn't support loopback mode); muxed in only when real samples were captured, degrading gracefully to video-only otherwise.
+- [x] **Video hotkeys & UI**: Start/Stop Record button + hotkeys (default `F12`/`Shift+F12`), Target FPS and ffmpeg path settings, hidden ffmpeg console window, optional cleanup of intermediate PNG/WAV files after a successful encode.
+- [x] **Show/Hide Window hotkey**: guaranteed way to restore the window (default `Ctrl+Alt+Insert`) independent of the system tray icon.
+- [x] **Multi-Screenshot PDF Export**: manual "Export to PDF" button on the History tab, plus an opt-in auto-export when a session ends (`src/pdf_export.rs`, via `printpdf`). Individual images are always kept — the PDF is additional.
+
+---
+
+## 🔧 Outstanding / Near-term
+- [ ] **Progress bar / spinner for MP4 & PDF creation**: currently "Stopping & encoding video..." / PDF export are only reflected as status-bar text with no visual busy indicator — add a spinner or progress bar so it's clear the app is working, not frozen, especially since encoding still blocks the UI thread until ffmpeg finishes.
+- [ ] **Async ffmpeg mux**: the final ffmpeg encode step still runs synchronously on `stop_video()`, blocking the UI momentarily for longer recordings — move it off the UI-blocking path (ties in with the progress indicator above).
+- [ ] **Wire up "Keep running in System Tray when minimized"**: this Settings checkbox is currently a no-op — nothing intercepts the native window minimize/close event to act on it; minimizing just does the normal OS behavior regardless of the setting.
+- [ ] **Recording HUD**: Pulsating red ROI border overlay + recording timer pill (`REC 00:01:24`) during video capture.
 - [ ] **Magnifier Loupe**: 8x pixel magnifier near cursor during interactive drag-selection for pixel-perfect edge alignment.
+- [ ] **In-process H.264 encoding**: replace the external `ffmpeg` dependency with an in-process encoder (e.g. `openh264`) + muxer, so video recording works without requiring ffmpeg to be installed/bundled.
+- [ ] **WASAPI silent-gap handling**: loopback capture only delivers packets while something is actively rendering audio; a completely silent stretch mid-recording may not get continuous padding, which can drift audio/video sync on quiet recordings — needs a dummy silent render stream to keep the audio engine "awake," or explicit gap-filling.
 
 ---
 

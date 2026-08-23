@@ -1,6 +1,6 @@
 [package]
 name = "shotgun"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Noerotech"]
 description = "Fast, lightweight screen & region capture utility with global hotkeys, sequential naming, tray icon, and auto-start."
@@ -27,6 +27,19 @@ crossbeam-channel = "0.5"
 arboard = "3.4"
 winreg = "0.52"
 tray-icon = "0.19"
+hound = "3.5"
+windows = { version = "0.58", features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+] }
+printpdf = { version = "0.12", features = ["images", "png", "jpeg"] }
+
 
 
 

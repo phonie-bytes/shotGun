@@ -131,6 +131,27 @@ pub struct AppConfig {
     pub close_to_tray: bool,
     pub capture_hotkey: HotkeyConfig,
     pub new_session_hotkey: HotkeyConfig,
+    #[serde(default = "default_video_start_hotkey")]
+    pub video_start_hotkey: HotkeyConfig,
+    #[serde(default = "default_video_stop_hotkey")]
+    pub video_stop_hotkey: HotkeyConfig,
+    #[serde(default = "default_toggle_window_hotkey")]
+    pub toggle_window_hotkey: HotkeyConfig,
+    #[serde(default = "default_video_fps")]
+    pub video_fps: u32,
+    /// Path to the ffmpeg executable. Empty string = auto-detect (next to the
+    /// app, then fall back to PATH).
+    #[serde(default)]
+    pub ffmpeg_path: String,
+    /// Delete the intermediate PNG frames, audio.wav, and concat script once
+    /// the MP4 has been successfully created.
+    #[serde(default)]
+    pub cleanup_video_frames_after_encode: bool,
+    /// When starting a New Session, automatically bundle the screenshots
+    /// from the session that just ended into a PDF (in addition to keeping
+    /// the individual image files).
+    #[serde(default)]
+    pub auto_export_pdf_on_session: bool,
 }
 
 impl Default for AppConfig {
@@ -172,7 +193,65 @@ impl Default for AppConfig {
                 vk_code: 0x79, // F10
                 key_name: "F10".to_string(),
             },
+            video_start_hotkey: HotkeyConfig {
+                ctrl: false,
+                alt: false,
+                shift: false,
+                win: false,
+                vk_code: 0x7B, // F12
+                key_name: "F12".to_string(),
+            },
+            video_stop_hotkey: HotkeyConfig {
+                ctrl: false,
+                alt: false,
+                shift: true,
+                win: false,
+                vk_code: 0x7B, // F12 (with Shift)
+                key_name: "F12".to_string(),
+            },
+            toggle_window_hotkey: default_toggle_window_hotkey(),
+            video_fps: 30,
+            ffmpeg_path: String::new(),
+            cleanup_video_frames_after_encode: false,
+            auto_export_pdf_on_session: false,
         }
+    }
+}
+
+fn default_video_fps() -> u32 {
+    30
+}
+
+fn default_video_start_hotkey() -> HotkeyConfig {
+    HotkeyConfig {
+        ctrl: false,
+        alt: false,
+        shift: false,
+        win: false,
+        vk_code: 0x7B, // F12
+        key_name: "F12".to_string(),
+    }
+}
+
+fn default_video_stop_hotkey() -> HotkeyConfig {
+    HotkeyConfig {
+        ctrl: false,
+        alt: false,
+        shift: true,
+        win: false,
+        vk_code: 0x7B, // F12 (with Shift)
+        key_name: "F12".to_string(),
+    }
+}
+
+fn default_toggle_window_hotkey() -> HotkeyConfig {
+    HotkeyConfig {
+        ctrl: true,
+        alt: true,
+        shift: false,
+        win: false,
+        vk_code: 0x2D, // Insert
+        key_name: "Insert".to_string(),
     }
 }
 
