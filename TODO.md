@@ -31,10 +31,11 @@
 - [ ] **Magnifier Loupe**: 8x pixel magnifier near cursor during interactive drag-selection for pixel-perfect edge alignment.
 - [ ] **In-process H.264 encoding**: replace the external `ffmpeg` dependency with an in-process encoder (e.g. `openh264`) + muxer, so video recording works without requiring ffmpeg to be installed/bundled.
 - [ ] **WASAPI silent-gap handling**: loopback capture only delivers packets while something is actively rendering audio; a completely silent stretch mid-recording may not get continuous padding, which can drift audio/video sync on quiet recordings — needs a dummy silent render stream to keep the audio engine "awake," or explicit gap-filling.
+- [ ] **Post-capture / on-screen editor**: annotation toolbar (Arrow, Rectangle, Highlighter, Text, Blur sensitive data) applied after a screenshot is captured — most natural fit is a step on the freeze overlay itself (drag-select ROI, then annotate, then save), rather than a separate editor window. Sized feature: needs tool-selection UI, draw state + undo, and rendering annotations into the final saved image.
+- [ ] **Copy recorded video clip to clipboard**: mirror the existing screenshot "📋 Copy to Clipboard" for finished video recordings. Video has no standard "paste video data" clipboard format the way images do, so the practical version is copying the **file itself** (like Ctrl+C on a file in Explorer, so it pastes as a file into Discord/Slack/email) via the Windows `CF_HDROP` clipboard format — `arboard` doesn't support this, needs raw Win32 clipboard calls. Also needs a video-history list in the UI first (finished recordings currently only show up as a status-bar message, not a list like screenshots get in the History tab) to have somewhere to put the button.
 
 ---
 
 ## 🔮 v0.4.0 (Future Vision)
-- [ ] **On-Screen Annotation Tools**: Drawing toolbar on freeze overlay (Arrow, Rectangle, Highlighter, Text, and Blur sensitive data).
 - [ ] **LLM Vision Session Analysis**: Send captured session screenshots to Gemini / Claude / OpenAI / local Ollama endpoint with user instructions to generate Markdown documentation, summaries, or structured data.
 - [ ] **Cross-Platform Support**: Linux (X11 / Wayland) and macOS (CoreGraphics & Accessibility API).
