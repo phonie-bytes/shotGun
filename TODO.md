@@ -1,33 +1,28 @@
 # 📝 shotGun - TODO & Roadmap
 
-## 🎯 v0.1.0 (Current Release - Completed)
-- [x] Multi-monitor detection and selection dropdown with resolution, scale factor, and position coordinates.
-- [x] Interactive snipping overlay: freeze-frame background with drag-to-select rectangle bounding box and dimension display.
-- [x] Manual ROI numeric coordinates input with quick presets (Top/Bottom half, Left/Right half, Center 50%).
-- [x] Native Win32 global hotkeys using `RegisterHotKey` in a dedicated low-overhead thread.
-- [x] Configurable hotkey combinations (Modifiers: Ctrl, Alt, Shift, Win + Keys: F1-F12, Letters, Numbers, PrintScreen, etc.).
-- [x] Capture Hotkey and "Start New Session / Reset Counter" Hotkey.
-- [x] Multi-format image export: Lossless PNG, JPEG (with quality slider 1-100), BMP, and lossless WebP.
-- [x] Sequential filename incrementing with customizable prefix and zero-padding (e.g. `shot_001.png`, `shot_002.png`).
-- [x] Session subfolder generation option (`captures/session_01/shot_001.png`).
-- [x] Audio chime feedback upon capture (Windows standard MessageBeep).
-- [x] Capture History list with timestamps, file sizes, resolutions, "Open Image", "Locate in Explorer", and "Copy to Clipboard".
-- [x] Persistent JSON configuration saving and loading (`config.json`).
-- [x] Unit test suite for hotkey calculations, serialization, and region cropping math.
+## 🎯 v0.2.0 (Current Release - Completed)
+- [x] **Page 0 / 0-Indexed Support**: Allow starting counter at `0` (e.g. `shot_000.png` for cover pages/prefaces) or `1`.
+- [x] **Interactive Session Reset Dialog**: Prompt modal to confirm/edit destination path, session name, file prefix, and starting number on session reset.
+- [x] **System Tray Integration**: Minimize to tray with custom icon and context menu (*Show/Hide*, *Capture*, *New Session*, *Exit*).
+- [x] **Windows Auto-Start Toggle**: Registry integration with `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+- [x] **Compact UI Redesign**: Slim, streamlined window layout (~580x440 px).
+- [x] **Multi-Monitor & ROI Crop**: Dynamic monitor detection, live freeze-frame snipping tool, and manual coordinate controls.
+- [x] **Global Hotkey Engine**: Zero-polling Win32 `RegisterHotKey` loop for capture and session reset.
+- [x] **Multi-Format Export**: PNG, JPEG with quality slider, BMP, and WebP encoders.
+- [x] **Capture History & Clipboard**: Real-time history with instant open, locate, and copy to clipboard.
+- [x] **Rebranded for Noerotech**.
 
 ---
 
-## 🚀 v0.2.0 (Near-term Roadmap)
-- [ ] **System Tray Integration**: Minimize shotGun to the Windows system tray with a right-click context menu to pause/resume hotkeys and quickly change modes.
-- [ ] **Magnifier Loupe**: Add an 8x pixel magnifier loupe near the cursor during interactive drag-selection for pixel-perfect edge alignment.
-- [ ] **Animated GIF / WebP Burst Recording**: Allow holding the capture hotkey to record a short animated GIF or WebP loop of the selected region.
-- [ ] **On-screen Annotation Tools**: Add arrow, highlighter, text, rectangle, and blur/pixelate tools directly to the freeze-frame snipping tool before saving.
-- [ ] **OCR (Optical Character Recognition)**: Add an optional "Copy Text from Region" mode using Tesseract or Windows Media OCR.
+## 🚀 v0.3.0 (Near-term Roadmap)
+- [ ] **Video Recording (MP4)**: Continuous frame grab from selected ROI (DXGI / Windows Graphics Capture) encoded to H.264 MP4.
+- [ ] **Desktop Audio Capture (WASAPI Loopback)**: Capture system and application audio playing in the background, muxed into the video recording.
+- [ ] **Recording HUD**: Pulsating red ROI border overlay + recording timer pill (`REC 00:01:24`).
+- [ ] **Magnifier Loupe**: 8x pixel magnifier near cursor during interactive drag-selection for pixel-perfect edge alignment.
 
 ---
 
-## 🔮 v0.3.0 (Future Vision)
-- [ ] **Cross-Platform Support**: Linux (X11 / Wayland via `xcap` & `global-hotkey`) and macOS (CoreGraphics & Accessibility API).
-- [ ] **Cloud & Webhook Uploads**: Automated upload to S3, Google Drive, Imgur, or custom HTTP webhooks with automatic URL copying to clipboard.
-- [ ] **Delay Timer**: Configurable countdown timer (e.g. 3s, 5s) before capture for capturing transient context menus and tooltips.
-- [ ] **Multi-Region Capture**: Define multiple ROI bounding boxes and capture all of them simultaneously into separate files with one hotkey press.
+## 🔮 v0.4.0 (Future Vision)
+- [ ] **On-Screen Annotation Tools**: Drawing toolbar on freeze overlay (Arrow, Rectangle, Highlighter, Text, and Blur sensitive data).
+- [ ] **LLM Vision Session Analysis**: Send captured session screenshots to Gemini / Claude / OpenAI / local Ollama endpoint with user instructions to generate Markdown documentation, summaries, or structured data.
+- [ ] **Cross-Platform Support**: Linux (X11 / Wayland) and macOS (CoreGraphics & Accessibility API).

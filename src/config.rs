@@ -26,6 +26,7 @@ impl OutputFormat {
         }
     }
 
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             OutputFormat::Png => "PNG (Lossless)",
@@ -118,12 +119,16 @@ pub struct AppConfig {
     pub file_prefix: String,
     pub padding_digits: usize,
     pub counter: u64,
+    pub start_index: u64,
     pub session_index: u64,
     pub session_prefix: String,
     pub use_session_subfolders: bool,
+    pub prompt_on_new_session: bool,
     pub play_sound: bool,
     pub auto_increment: bool,
     pub overwrite_existing: bool,
+    pub minimize_to_tray: bool,
+    pub close_to_tray: bool,
     pub capture_hotkey: HotkeyConfig,
     pub new_session_hotkey: HotkeyConfig,
 }
@@ -141,12 +146,16 @@ impl Default for AppConfig {
             file_prefix: "shot_".to_string(),
             padding_digits: 3,
             counter: 1,
+            start_index: 1,
             session_index: 1,
             session_prefix: "session_".to_string(),
             use_session_subfolders: false,
+            prompt_on_new_session: true,
             play_sound: true,
             auto_increment: true,
             overwrite_existing: false,
+            minimize_to_tray: true,
+            close_to_tray: false,
             capture_hotkey: HotkeyConfig {
                 ctrl: false,
                 alt: false,
@@ -178,7 +187,7 @@ fn dirs_default_pictures_dir() -> Option<PathBuf> {
 
 impl AppConfig {
     pub fn config_path() -> PathBuf {
-        if let Some(proj_dirs) = directories::ProjectDirs::from("com", "phoniebytes", "shotgun") {
+        if let Some(proj_dirs) = directories::ProjectDirs::from("com", "noerotech", "shotgun") {
             let config_dir = proj_dirs.config_dir();
             let _ = std::fs::create_dir_all(config_dir);
             config_dir.join("config.json")
@@ -247,12 +256,15 @@ mod tests {
 
     #[test]
     fn test_config_serialization() {
-        let cfg = AppConfig::default();
+        let mut cfg = AppConfig::default();
+        cfg.start_index = 0;
+        cfg.counter = 0;
         let json = serde_json::to_string(&cfg).expect("Serialization failed");
         let deserialized: AppConfig = serde_json::from_str(&json).expect("Deserialization failed");
-        assert_eq!(cfg.counter, deserialized.counter);
+        assert_eq!(deserialized.counter, 0);
+        assert_eq!(deserialized.start_index, 0);
         assert_eq!(cfg.file_prefix, deserialized.file_prefix);
         assert_eq!(cfg.format, deserialized.format);
+        assert!(deserialized.prompt_on_new_session);
     }
 }
-

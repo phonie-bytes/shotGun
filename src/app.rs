@@ -1,3 +1,4 @@
+use crate::autostart::{is_autostart_enabled, set_autostart};
 use crate::capture::{
     execute_capture, get_monitors, CaptureResult, MonitorInfo,
 };
@@ -6,12 +7,14 @@ use crate::hotkey::{
     AVAILABLE_KEYS, HotkeyAction, HotkeyEvent, HotkeyManager,
 };
 use crate::overlay::{OverlayAction, RegionSelectorOverlay};
+use crate::tray::{TrayAction, TrayHandler};
 use crossbeam_channel::Receiver;
 use egui::{
-    Align, Button, CentralPanel, Color32, Context, Layout, RichText, ScrollArea,
-    TopBottomPanel, Ui,
+    Align, Button, CentralPanel, Color32, Context, Layout, RichText, ScrollArea, TopBottomPanel,
+    Ui, ViewportCommand,
 };
-use std::path::Path;
+
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +23,7 @@ pub enum ActiveTab {
     Hotkeys,
     OutputNaming,
     History,
+    Settings,
     About,
 }
 
@@ -34,20 +38,32 @@ pub struct ShotgunApp {
     pub history: Vec<CaptureResult>,
     pub status_message: String,
     pub overlay: RegionSelectorOverlay,
-    // Hotkey edit state
+    pub tray_handler: Option<TrayHandler>,
+    pub window_visible: bool,
+    pub autostart_state: bool,
+
+    // Hotkey temp state
     pub temp_capture_key_idx: usize,
     pub temp_session_key_idx: usize,
+
+    // Interactive Session Reset Modal State
+    pub session_modal_open: bool,
+    pub temp_session_name: String,
+    pub temp_session_path: PathBuf,
+    pub temp_session_prefix: String,
+    pub temp_session_start_counter: u64,
+    pub temp_session_use_subfolder: bool,
 }
 
 impl ShotgunApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.window_rounding = 8.0.into();
-        visuals.panel_fill = Color32::from_rgb(20, 24, 30);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(28, 33, 41);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(36, 42, 53);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(52, 60, 75);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(68, 79, 99);
+        visuals.panel_fill = Color32::from_rgb(18, 22, 28);
+        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(26, 31, 39);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(33, 40, 50);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(48, 57, 72);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(64, 76, 96);
         cc.egui_ctx.set_visuals(visuals);
 
         let config = AppConfig::load();
@@ -68,6 +84,15 @@ impl ShotgunApp {
             .position(|k| k.vk_code == config.new_session_hotkey.vk_code)
             .unwrap_or(9); // Default F10
 
+        let tray_handler = TrayHandler::new().ok();
+        let autostart_state = is_autostart_enabled();
+
+        let temp_session_path = config.output_dir.clone();
+        let temp_session_prefix = config.file_prefix.clone();
+        let temp_session_name = format!("{}{:02}", config.session_prefix, config.session_index + 1);
+        let temp_session_start_counter = config.start_index;
+        let temp_session_use_subfolder = config.use_session_subfolders;
+
         Self {
             config,
             monitors,
@@ -79,8 +104,17 @@ impl ShotgunApp {
             history: Vec::new(),
             status_message: "Ready. Press capture hotkey or button to take a screenshot.".to_string(),
             overlay: RegionSelectorOverlay::new(),
+            tray_handler,
+            window_visible: true,
+            autostart_state,
             temp_capture_key_idx,
             temp_session_key_idx,
+            session_modal_open: false,
+            temp_session_name,
+            temp_session_path,
+            temp_session_prefix,
+            temp_session_start_counter,
+            temp_session_use_subfolder,
         }
     }
 
@@ -107,13 +141,48 @@ impl ShotgunApp {
         }
     }
 
-    pub fn do_new_session(&mut self) {
+    pub fn trigger_new_session(&mut self, ctx: &Context) {
+        if self.config.prompt_on_new_session {
+            // Restore window if minimized and open prompt modal
+            self.window_visible = true;
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+
+            self.temp_session_path = self.config.output_dir.clone();
+            self.temp_session_prefix = self.config.file_prefix.clone();
+            self.temp_session_name = format!("{}{:02}", self.config.session_prefix, self.config.session_index + 1);
+            self.temp_session_start_counter = self.config.start_index;
+            self.temp_session_use_subfolder = self.config.use_session_subfolders;
+            self.session_modal_open = true;
+        } else {
+            self.silent_new_session();
+        }
+    }
+
+    pub fn silent_new_session(&mut self) {
         self.config.session_index += 1;
-        self.config.counter = 1;
+        self.config.counter = self.config.start_index;
         let _ = self.config.save();
         self.status_message = format!(
-            "🔄 Started New Session #{} (Counter reset to 1)",
-            self.config.session_index
+            "🔄 Started New Session #{} (Counter reset to {})",
+            self.config.session_index, self.config.start_index
+        );
+    }
+
+    pub fn apply_new_session_from_modal(&mut self) {
+        self.config.output_dir = self.temp_session_path.clone();
+        self.config.file_prefix = self.temp_session_prefix.clone();
+        self.config.session_index += 1;
+        self.config.counter = self.temp_session_start_counter;
+        self.config.use_session_subfolders = self.temp_session_use_subfolder;
+        let _ = self.config.save();
+
+        self.session_modal_open = false;
+        self.status_message = format!(
+            "🔄 Configured Session #{}: Start = {}, Folder = {}",
+            self.config.session_index,
+            self.config.counter,
+            self.config.output_dir.file_name().unwrap_or_default().to_string_lossy()
         );
     }
 
@@ -181,17 +250,40 @@ impl ShotgunApp {
 
 impl eframe::App for ShotgunApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // Request repaint if hotkey events or overlay active
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
-        // Process incoming hotkey events
+        // 1. Process System Tray Events
+        if let Some(tray) = &self.tray_handler {
+            if let Some(action) = tray.check_events() {
+                match action {
+                    TrayAction::ToggleShowWindow => {
+                        self.window_visible = !self.window_visible;
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(self.window_visible));
+                        if self.window_visible {
+                            ctx.send_viewport_cmd(ViewportCommand::Focus);
+                        }
+                    }
+                    TrayAction::TriggerCapture => {
+                        self.do_capture();
+                    }
+                    TrayAction::TriggerNewSession => {
+                        self.trigger_new_session(ctx);
+                    }
+                    TrayAction::ExitApp => {
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+
+        // 2. Process Incoming Hotkey Events
         while let Ok(event) = self.hotkey_rx.try_recv() {
             match event {
                 HotkeyEvent::Triggered(HotkeyAction::Capture) => {
                     self.do_capture();
                 }
                 HotkeyEvent::Triggered(HotkeyAction::NewSession) => {
-                    self.do_new_session();
+                    self.trigger_new_session(ctx);
                 }
                 HotkeyEvent::RegisteredStatus {
                     capture_ok,
@@ -204,7 +296,7 @@ impl eframe::App for ShotgunApp {
             }
         }
 
-        // Render full-screen overlay if snipping mode is active
+        // 3. Render Full-Screen Snipping Overlay if Active
         match self.overlay.show(ctx) {
             OverlayAction::Confirmed(region) => {
                 self.config.region = Some(region);
@@ -224,69 +316,70 @@ impl eframe::App for ShotgunApp {
             return;
         }
 
-        // 1. Top Bar Header
+        // 4. Top Header & Nav Bar (Compact & Sleek)
         TopBottomPanel::top("top_header").show(ctx, |ui| {
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading(RichText::new("🎯 shotGun").size(20.0).strong().color(Color32::from_rgb(0, 220, 255)));
-                ui.label(RichText::new("v0.1.0").size(12.0).color(Color32::GRAY));
+                ui.heading(RichText::new("🎯 shotGun").size(17.0).strong().color(Color32::from_rgb(0, 220, 255)));
+                ui.label(RichText::new("v0.2.0").size(11.0).color(Color32::GRAY));
 
                 ui.separator();
 
                 // Hotkey status badge
                 let (cap_ok, sess_ok) = self.hotkey_status;
                 if cap_ok && sess_ok {
-                    ui.label(RichText::new("🟢 Hotkeys Active").size(12.0).color(Color32::from_rgb(70, 220, 100)));
+                    ui.label(RichText::new("🟢 Active").size(11.0).color(Color32::from_rgb(70, 220, 100)));
                 } else {
                     let err = self.hotkey_error.as_deref().unwrap_or("Binding error");
-                    ui.label(RichText::new(format!("🔴 {err}")).size(12.0).color(Color32::from_rgb(255, 100, 100)));
+                    ui.label(RichText::new(format!("🔴 {err}")).size(11.0).color(Color32::from_rgb(255, 100, 100)));
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button(RichText::new("🔄 New Session").strong()).on_hover_text(format!("Reset counter to 1 and advance session. Hotkey: [{}]", self.config.new_session_hotkey.display_string())).clicked() {
-                        self.do_new_session();
+                    if ui.button(RichText::new("🔄 New Session").size(12.0).strong()).on_hover_text(format!("Reset counter & configure session. Hotkey: [{}]", self.config.new_session_hotkey.display_string())).clicked() {
+                        self.trigger_new_session(ctx);
                     }
 
-                    if ui.button(RichText::new("📸 Capture Screen").color(Color32::from_rgb(0, 220, 255)).strong()).on_hover_text(format!("Capture selected region. Hotkey: [{}]", self.config.capture_hotkey.display_string())).clicked() {
+                    if ui.button(RichText::new("📸 Capture").size(12.0).color(Color32::from_rgb(0, 220, 255)).strong()).on_hover_text(format!("Capture selected region. Hotkey: [{}]", self.config.capture_hotkey.display_string())).clicked() {
                         self.do_capture();
                     }
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(3.0);
 
-            // Tab bar
+            // Tab Navigation Bar
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.active_tab, ActiveTab::ScreenRegion, "🖥️ Screen & Region");
-                ui.selectable_value(&mut self.active_tab, ActiveTab::Hotkeys, "⌨️ Global Hotkeys");
-                ui.selectable_value(&mut self.active_tab, ActiveTab::OutputNaming, "📁 Output & Naming");
+                ui.selectable_value(&mut self.active_tab, ActiveTab::ScreenRegion, "🖥️ Screen");
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Hotkeys, "⌨️ Hotkeys");
+                ui.selectable_value(&mut self.active_tab, ActiveTab::OutputNaming, "📁 Output");
                 ui.selectable_value(&mut self.active_tab, ActiveTab::History, format!("📜 History ({})", self.history.len()));
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Settings, "⚙️ Settings");
                 ui.selectable_value(&mut self.active_tab, ActiveTab::About, "ℹ️ About");
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
         });
 
-        // 2. Bottom Status Bar
+        // 5. Bottom Status Bar
         TopBottomPanel::bottom("bottom_status").show(ctx, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&self.status_message).size(13.0));
+                ui.label(RichText::new(&self.status_message).size(11.5));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let mon_name = self
                         .monitors
                         .get(self.config.monitor_index)
                         .map(|m| m.name.clone())
-                        .unwrap_or_else(|| "None".to_string());
+                        .unwrap_or_else(|| "Display 1".to_string());
                     let reg_str = match self.config.region {
-                        Some(r) => format!("Region: {}x{} @ ({},{})", r.width, r.height, r.x, r.y),
+                        Some(r) => format!("ROI: {}x{} @ ({},{})", r.width, r.height, r.x, r.y),
                         None => "Full Screen".to_string(),
                     };
-                    ui.label(RichText::new(format!("Monitor: {mon_name} | {reg_str}")).size(12.0).color(Color32::GRAY));
+                    ui.label(RichText::new(format!("{mon_name} | {reg_str}")).size(11.0).color(Color32::GRAY));
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
         });
 
-        // 3. Central Content Panel
+        // 6. Central Content Panel
         CentralPanel::default().show(ctx, |ui| {
             ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 match self.active_tab {
@@ -294,28 +387,78 @@ impl eframe::App for ShotgunApp {
                     ActiveTab::Hotkeys => self.render_hotkeys_tab(ui),
                     ActiveTab::OutputNaming => self.render_output_tab(ui),
                     ActiveTab::History => self.render_history_tab(ui),
+                    ActiveTab::Settings => self.render_settings_tab(ui),
                     ActiveTab::About => self.render_about_tab(ui),
                 }
             });
         });
+
+        // 7. Interactive Session Reset Modal
+        if self.session_modal_open {
+            egui::Window::new("🔄 Configure New Session")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .fixed_size([460.0, 240.0])
+                .show(ctx, |ui| {
+                    ui.label("Configure destination folder and numbering for this new session:");
+                    ui.add_space(8.0);
+
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Folder:");
+                            ui.label(RichText::new(self.temp_session_path.to_string_lossy()).monospace().size(11.0));
+                            if ui.button("Browse...").clicked() {
+                                if let Some(folder) = rfd::FileDialog::new()
+                                    .set_directory(&self.temp_session_path)
+                                    .pick_folder()
+                                {
+                                    self.temp_session_path = folder;
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("File Prefix:");
+                            ui.text_edit_singleline(&mut self.temp_session_prefix);
+
+                            ui.label("Start Count:");
+                            ui.add(egui::DragValue::new(&mut self.temp_session_start_counter).range(0..=99999));
+                        });
+
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut self.temp_session_use_subfolder, "Create dedicated subfolder for session");
+                    });
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("🚀 Start Session").strong().color(Color32::from_rgb(0, 220, 255))).clicked() {
+                            self.apply_new_session_from_modal();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.session_modal_open = false;
+                        }
+                    });
+                });
+        }
     }
 }
 
 impl ShotgunApp {
     fn render_screen_region_tab(&mut self, ui: &mut Ui, ctx: &Context) {
-        ui.heading("🖥️ Display & Region Selection");
-        ui.label("Choose which monitor to capture and specify the exact region of interest (ROI).");
-        ui.add_space(8.0);
+        ui.heading("🖥️ Display & Region of Interest (ROI)");
+        ui.add_space(4.0);
 
         // Monitor Selector Card
         ui.group(|ui| {
             ui.horizontal(|ui| {
-                ui.strong("Select Screen / Monitor:");
-                if ui.button("🔄 Refresh Monitors").clicked() {
+                ui.strong("Target Monitor:");
+                if ui.button("🔄 Refresh").clicked() {
                     self.refresh_monitors();
                 }
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
 
             if self.monitors.is_empty() {
                 ui.colored_label(Color32::from_rgb(255, 100, 100), "No monitors detected!");
@@ -324,15 +467,13 @@ impl ShotgunApp {
                     let is_selected = self.config.monitor_index == idx;
                     let primary_badge = if mon.is_primary { " [Primary]" } else { "" };
                     let label_text = format!(
-                        "{} {}{} - {}x{} (scale: {:.1}x) at ({}, {})",
+                        "{} {}{} - {}x{} (scale: {:.1}x)",
                         if is_selected { "🔘" } else { "⚪" },
                         mon.name,
                         primary_badge,
                         mon.width,
                         mon.height,
                         mon.scale_factor,
-                        mon.x,
-                        mon.y
                     );
 
                     if ui.selectable_label(is_selected, label_text).clicked() {
@@ -343,19 +484,19 @@ impl ShotgunApp {
             }
         });
 
-        ui.add_space(12.0);
+        ui.add_space(6.0);
 
         // Region Selection Mode Card
         ui.group(|ui| {
-            ui.strong("Region of Interest (ROI):");
-            ui.add_space(6.0);
+            ui.strong("Capture Area (ROI):");
+            ui.add_space(4.0);
 
             ui.horizontal(|ui| {
                 let is_full = self.config.region.is_none();
-                if ui.selectable_label(is_full, "🖥️ Entire Screen (Full Monitor)").clicked() {
+                if ui.selectable_label(is_full, "🖥️ Full Screen").clicked() {
                     self.config.region = None;
                     let _ = self.config.save();
-                    self.status_message = "Capture mode set to Full Screen.".to_string();
+                    self.status_message = "Mode: Full Screen.".to_string();
                 }
 
                 let is_custom = self.config.region.is_some();
@@ -374,32 +515,32 @@ impl ShotgunApp {
                 }
             });
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
 
-            // Interactive Drag Selector Button
+            // Big Interactive Drag Button
             if ui.add_sized(
-                [ui.available_width(), 38.0],
-                Button::new(RichText::new("🎯 Interactive Drag-Select on Screen (Snipping Overlay)").size(15.0).strong().color(Color32::from_rgb(0, 220, 255)))
-            ).on_hover_text("Freezes the screen and opens an interactive rectangle selector tool").clicked() {
+                [ui.available_width(), 32.0],
+                Button::new(RichText::new("🎯 Drag-Select ROI on Screen (Snipping Overlay)").size(13.5).strong().color(Color32::from_rgb(0, 220, 255)))
+            ).on_hover_text("Freezes screen to draw a precise ROI rectangle").clicked() {
                 if let Err(e) = self.overlay.start(ctx, self.config.monitor_index) {
-                    self.status_message = format!("Failed to start snipping overlay: {e}");
+                    self.status_message = format!("Overlay error: {e}");
                 }
             }
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
 
             // Quick presets
             ui.horizontal_wrapped(|ui| {
-                ui.label("Quick Region Presets:");
+                ui.label("Presets:");
                 if let Some(mon) = self.monitors.get(self.config.monitor_index) {
                     let w = mon.width;
                     let h = mon.height;
 
-                    if ui.button("Top Half").clicked() {
+                    if ui.button("Top 50%").clicked() {
                         self.config.region = Some(RectRegion { x: 0, y: 0, width: w, height: h / 2 });
                         let _ = self.config.save();
                     }
-                    if ui.button("Bottom Half").clicked() {
+                    if ui.button("Bottom 50%").clicked() {
                         self.config.region = Some(RectRegion { x: 0, y: h / 2, width: w, height: h / 2 });
                         let _ = self.config.save();
                     }
@@ -420,10 +561,10 @@ impl ShotgunApp {
 
             // Manual coordinate fields
             if let Some(mut r) = self.config.region {
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 ui.separator();
                 ui.strong("Fine-tune Pixel Coordinates:");
-                ui.add_space(4.0);
+                ui.add_space(2.0);
 
                 let mut changed = false;
                 ui.horizontal(|ui| {
@@ -433,10 +574,10 @@ impl ShotgunApp {
                     ui.label("Y:");
                     changed |= ui.add(egui::DragValue::new(&mut r.y).speed(1.0).range(0..=10000)).changed();
 
-                    ui.label("Width:");
+                    ui.label("W:");
                     changed |= ui.add(egui::DragValue::new(&mut r.width).speed(1.0).range(1..=10000)).changed();
 
-                    ui.label("Height:");
+                    ui.label("H:");
                     changed |= ui.add(egui::DragValue::new(&mut r.height).speed(1.0).range(1..=10000)).changed();
                 });
 
@@ -449,15 +590,14 @@ impl ShotgunApp {
     }
 
     fn render_hotkeys_tab(&mut self, ui: &mut Ui) {
-        ui.heading("⌨️ Global Hotkeys Configuration");
-        ui.label("Global hotkeys work anywhere in Windows, even when shotGun is minimized or another application is active.");
-        ui.add_space(8.0);
+        ui.heading("⌨️ Global OS Hotkeys");
+        ui.label("Works globally across Windows in any app or fullscreen game.");
+        ui.add_space(6.0);
 
         // Capture Hotkey Box
         ui.group(|ui| {
-            ui.strong(RichText::new("📸 Screenshot Capture Hotkey").size(15.0));
-            ui.label("Triggers an instant screenshot of the selected screen / region.");
-            ui.add_space(6.0);
+            ui.strong(RichText::new("📸 Screenshot Capture Hotkey").size(14.0));
+            ui.add_space(4.0);
 
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.config.capture_hotkey.ctrl, "Ctrl");
@@ -477,22 +617,20 @@ impl ShotgunApp {
                     });
             });
 
-            ui.add_space(4.0);
             let cap_str = {
                 let mut temp = self.config.capture_hotkey.clone();
                 temp.key_name = AVAILABLE_KEYS[self.temp_capture_key_idx].name.to_string();
                 temp.display_string()
             };
-            ui.label(RichText::new(format!("Current Binding: [{cap_str}]")).strong().color(Color32::from_rgb(0, 220, 255)));
+            ui.label(RichText::new(format!("Current: [{cap_str}]")).strong().color(Color32::from_rgb(0, 220, 255)));
         });
 
-        ui.add_space(12.0);
+        ui.add_space(8.0);
 
         // New Session / Reset Hotkey Box
         ui.group(|ui| {
-            ui.strong(RichText::new("🔄 Start New Session / Reset Counter Hotkey").size(15.0));
-            ui.label("Resets the filename increment number back to 1 and starts a new session.");
-            ui.add_space(6.0);
+            ui.strong(RichText::new("🔄 New Session / Reset Counter Hotkey").size(14.0));
+            ui.add_space(4.0);
 
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.config.new_session_hotkey.ctrl, "Ctrl");
@@ -512,36 +650,32 @@ impl ShotgunApp {
                     });
             });
 
-            ui.add_space(4.0);
             let sess_str = {
                 let mut temp = self.config.new_session_hotkey.clone();
                 temp.key_name = AVAILABLE_KEYS[self.temp_session_key_idx].name.to_string();
                 temp.display_string()
             };
-            ui.label(RichText::new(format!("Current Binding: [{sess_str}]")).strong().color(Color32::from_rgb(0, 220, 255)));
+            ui.label(RichText::new(format!("Current: [{sess_str}]")).strong().color(Color32::from_rgb(0, 220, 255)));
         });
 
-        ui.add_space(12.0);
+        ui.add_space(10.0);
 
-        if ui.add_sized([ui.available_width(), 36.0], Button::new(RichText::new("💾 Save & Apply Hotkey Changes").strong())).clicked() {
+        if ui.add_sized([ui.available_width(), 32.0], Button::new(RichText::new("💾 Save & Apply Hotkey Changes").strong())).clicked() {
             self.apply_hotkeys();
         }
     }
 
     fn render_output_tab(&mut self, ui: &mut Ui) {
-        ui.heading("📁 Output Destination & File Naming");
-        ui.label("Configure where screenshots are stored and how filenames increment.");
-        ui.add_space(8.0);
+        ui.heading("📁 Output Destination & Naming");
+        ui.add_space(4.0);
 
         // Destination Folder Card
         ui.group(|ui| {
             ui.strong("Destination Folder:");
-            ui.add_space(4.0);
+            ui.add_space(2.0);
+            ui.label(RichText::new(self.config.output_dir.to_string_lossy()).monospace().size(11.5));
             ui.horizontal(|ui| {
-                ui.label(RichText::new(self.config.output_dir.to_string_lossy()).monospace());
-            });
-            ui.horizontal(|ui| {
-                if ui.button("📂 Browse Folder...").clicked() {
+                if ui.button("📂 Browse...").clicked() {
                     if let Some(folder) = rfd::FileDialog::new()
                         .set_directory(&self.config.output_dir)
                         .pick_folder()
@@ -550,30 +684,30 @@ impl ShotgunApp {
                         let _ = self.config.save();
                     }
                 }
-                if ui.button("🧭 Open in Explorer").clicked() {
+                if ui.button("🧭 Open Explorer").clicked() {
                     Self::open_folder(&self.config.output_dir);
                 }
             });
         });
 
-        ui.add_space(12.0);
+        ui.add_space(6.0);
 
         // Format & Quality Card
         ui.group(|ui| {
-            ui.strong("Image Format & Encoding:");
-            ui.add_space(6.0);
+            ui.strong("Image Format:");
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 for fmt in OutputFormat::ALL {
-                    if ui.selectable_value(&mut self.config.format, fmt, fmt.label()).clicked() {
+                    if ui.selectable_value(&mut self.config.format, fmt, fmt.extension().to_uppercase()).clicked() {
                         let _ = self.config.save();
                     }
                 }
             });
 
             if self.config.format == OutputFormat::Jpeg {
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label("JPEG Quality:");
+                    ui.label("Quality:");
                     if ui.add(egui::Slider::new(&mut self.config.jpeg_quality, 1..=100).text("%")).changed() {
                         let _ = self.config.save();
                     }
@@ -581,20 +715,20 @@ impl ShotgunApp {
             }
         });
 
-        ui.add_space(12.0);
+        ui.add_space(6.0);
 
-        // Sequential Naming & Increment Card
+        // Sequential Naming & Page 0 Card
         ui.group(|ui| {
-            ui.strong("Incremental File Naming:");
-            ui.add_space(6.0);
+            ui.strong("Sequential Numbering & Page 0 Options:");
+            ui.add_space(4.0);
 
             ui.horizontal(|ui| {
-                ui.label("Filename Prefix:");
+                ui.label("Prefix:");
                 if ui.text_edit_singleline(&mut self.config.file_prefix).changed() {
                     let _ = self.config.save();
                 }
 
-                ui.label("Zero-padding digits:");
+                ui.label("Digits:");
                 if ui.add(egui::DragValue::new(&mut self.config.padding_digits).range(1..=8)).changed() {
                     let _ = self.config.save();
                 }
@@ -603,12 +737,33 @@ impl ShotgunApp {
             ui.add_space(4.0);
 
             ui.horizontal(|ui| {
-                ui.label("Current Number Counter:");
-                if ui.add(egui::DragValue::new(&mut self.config.counter).range(1..=999999)).changed() {
+                ui.label("Default Start Index:");
+                let is_zero = self.config.start_index == 0;
+                if ui.selectable_label(is_zero, "0 (Page 0)").clicked() {
+                    self.config.start_index = 0;
+                    let _ = self.config.save();
+                }
+                let is_one = self.config.start_index == 1;
+                if ui.selectable_label(is_one, "1 (Page 1)").clicked() {
+                    self.config.start_index = 1;
+                    let _ = self.config.save();
+                }
+            });
+
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Current Counter:");
+                if ui.add(egui::DragValue::new(&mut self.config.counter).range(0..=999999)).changed() {
                     let _ = self.config.save();
                 }
 
-                if ui.button("Reset Counter to 1").clicked() {
+                if ui.button("Reset to 0").clicked() {
+                    self.config.counter = 0;
+                    let _ = self.config.save();
+                }
+
+                if ui.button("Reset to 1").clicked() {
                     self.config.counter = 1;
                     let _ = self.config.save();
                 }
@@ -623,26 +778,12 @@ impl ShotgunApp {
                 self.config.format.extension(),
                 width = self.config.padding_digits
             );
-            ui.label(RichText::new(format!("Next Output Filename: {preview_name}")).strong().color(Color32::from_rgb(0, 220, 255)));
+            ui.label(RichText::new(format!("Next Output: {preview_name}")).strong().color(Color32::from_rgb(0, 220, 255)));
 
-            ui.add_space(6.0);
-            ui.separator();
-            ui.strong("Session Settings:");
             ui.add_space(4.0);
+            ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.label("Session Index:");
-                if ui.add(egui::DragValue::new(&mut self.config.session_index).range(1..=99999)).changed() {
-                    let _ = self.config.save();
-                }
-
-                ui.label("Session Prefix:");
-                if ui.text_edit_singleline(&mut self.config.session_prefix).changed() {
-                    let _ = self.config.save();
-                }
-            });
-
-            if ui.checkbox(&mut self.config.use_session_subfolders, "Create a dedicated subfolder for each session (e.g. captures/session_01/)").changed() {
+            if ui.checkbox(&mut self.config.prompt_on_new_session, "Prompt for Path and Name when starting New Session").changed() {
                 let _ = self.config.save();
             }
 
@@ -650,11 +791,57 @@ impl ShotgunApp {
                 let _ = self.config.save();
             }
 
-            if ui.checkbox(&mut self.config.overwrite_existing, "Overwrite file if filename already exists").changed() {
+            if ui.checkbox(&mut self.config.overwrite_existing, "Overwrite if file already exists").changed() {
+                let _ = self.config.save();
+            }
+        });
+    }
+
+    fn render_settings_tab(&mut self, ui: &mut Ui) {
+        ui.heading("⚙️ System & Behavior Settings");
+        ui.add_space(4.0);
+
+        ui.group(|ui| {
+            ui.strong("Windows Integration:");
+            ui.add_space(4.0);
+
+            let mut autostart = self.autostart_state;
+            if ui.checkbox(&mut autostart, "🚀 Launch shotGun automatically on Windows startup").changed() {
+                if let Err(e) = set_autostart(autostart) {
+                    self.status_message = format!("Autostart error: {e}");
+                } else {
+                    self.autostart_state = autostart;
+                    self.status_message = if autostart {
+                        "Windows Startup Autostart enabled.".to_string()
+                    } else {
+                        "Windows Startup Autostart disabled.".to_string()
+                    };
+                }
+            }
+
+            ui.add_space(4.0);
+            if ui.checkbox(&mut self.config.minimize_to_tray, "Keep running in System Tray when minimized").changed() {
                 let _ = self.config.save();
             }
 
-            if ui.checkbox(&mut self.config.play_sound, "Play audio notification on capture").changed() {
+            if ui.checkbox(&mut self.config.play_sound, "Play audio chime on capture").changed() {
+                let _ = self.config.save();
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("Session Settings:");
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Current Session Index:");
+                if ui.add(egui::DragValue::new(&mut self.config.session_index).range(1..=99999)).changed() {
+                    let _ = self.config.save();
+                }
+            });
+
+            if ui.checkbox(&mut self.config.use_session_subfolders, "Create dedicated subfolder for each session (e.g. session_01/)").changed() {
                 let _ = self.config.save();
             }
         });
@@ -663,17 +850,17 @@ impl ShotgunApp {
     fn render_history_tab(&mut self, ui: &mut Ui) {
         ui.heading("📜 Capture History");
         ui.horizontal(|ui| {
-            ui.label(format!("Total captures in current run: {}", self.history.len()));
+            ui.label(format!("Total: {}", self.history.len()));
             if !self.history.is_empty() {
-                if ui.button("Clear History").clicked() {
+                if ui.button("Clear").clicked() {
                     self.history.clear();
                 }
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
         if self.history.is_empty() {
-            ui.label(RichText::new("No screenshots captured yet. Use your capture hotkey or the button above!").color(Color32::GRAY));
+            ui.label(RichText::new("No screenshots captured yet.").color(Color32::GRAY));
             return;
         }
 
@@ -684,18 +871,18 @@ impl ShotgunApp {
                     ui.label(RichText::new(item.file_path.file_name().unwrap_or_default().to_string_lossy()).strong());
                     ui.label(format!("{}x{} px", item.width, item.height));
                     ui.label(format!("{:.1} KB", item.file_size_bytes as f64 / 1024.0));
-                    ui.label(format!("Session #{} ({})", item.session, item.monitor_name));
-                    ui.label(RichText::new(&item.timestamp).color(Color32::GRAY));
+                    ui.label(RichText::new(&item.timestamp).color(Color32::GRAY).size(11.0));
                 });
 
+
                 ui.horizontal(|ui| {
-                    if ui.button("👁️ Open Image").clicked() {
+                    if ui.button("👁️ Open").clicked() {
                         Self::open_file(&item.file_path);
                     }
-                    if ui.button("📂 Locate in Folder").clicked() {
+                    if ui.button("📂 Locate").clicked() {
                         Self::select_in_explorer(&item.file_path);
                     }
-                    if ui.button("📋 Copy Image to Clipboard").clicked() {
+                    if ui.button("📋 Copy").clicked() {
                         if let Err(e) = Self::copy_image_to_clipboard(&item.file_path) {
                             self.status_message = format!("Clipboard error: {e}");
                         } else {
@@ -704,31 +891,31 @@ impl ShotgunApp {
                     }
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
         }
     }
 
     fn render_about_tab(&mut self, ui: &mut Ui) {
-        ui.heading("🎯 shotGun");
-        ui.label(RichText::new("Fast, Lightweight Screen & ROI Capture Utility").size(15.0).color(Color32::from_rgb(0, 220, 255)));
-        ui.add_space(8.0);
+        ui.heading("🎯 shotGun v0.2.0");
+        ui.label(RichText::new("Created by Noerotech").size(14.0).strong().color(Color32::from_rgb(0, 220, 255)));
+        ui.add_space(6.0);
 
-        ui.label("shotGun is built in high-performance Rust with native Win32 global hotkeys, immediate-mode GUI (egui), and multi-monitor screen capture (xcap).");
-        ui.add_space(8.0);
+        ui.label("High-performance screen & region capture utility built with Rust, native Win32 global hotkeys, immediate-mode GUI, and system tray integration.");
+        ui.add_space(6.0);
 
         ui.group(|ui| {
             ui.strong("Features:");
             ui.label("• Multi-Monitor Detection & Selection");
-            ui.label("• Interactive Snipping Overlay (Drag-to-select region)");
-            ui.label("• Global Hotkey Engine (Works in any application or game)");
-            ui.label("• Configurable Image Formats (PNG, JPEG with quality, BMP, WebP)");
-            ui.label("• Sequential Number Increments (e.g. shot_001.png, shot_002.png)");
-            ui.label("• 'Start New Session' Hotkey to reset counter or advance session subfolder");
-            ui.label("• Audio and visual capture feedback");
-            ui.label("• Capture history with instant open, locate, and copy to clipboard");
+            ui.label("• Interactive Freeze-Frame ROI Selector");
+            ui.label("• Page 0 / 0-Indexed Sequential Numbering");
+            ui.label("• Interactive Session Reset Prompt Dialog");
+            ui.label("• System Tray Icon & Windows Startup Auto-Start");
+            ui.label("• Global Hotkey Engine (Capture & New Session)");
+            ui.label("• PNG, JPEG, BMP, and WebP Encoders");
+            ui.label("• Compact & Responsive UI");
         });
 
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         ui.label(RichText::new("Repository: https://github.com/phonie-bytes/shotGun").color(Color32::from_rgb(100, 180, 255)));
     }
 }

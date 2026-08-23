@@ -1,9 +1,9 @@
 [package]
 name = "shotgun"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-authors = ["phonie-bytes"]
-description = "Lightweight, configurable screen & region capture utility with global hotkeys and sequential naming."
+authors = ["Noerotech"]
+description = "Fast, lightweight screen & region capture utility with global hotkeys, sequential naming, tray icon, and auto-start."
 
 [dependencies]
 eframe = "0.29"
@@ -17,12 +17,16 @@ chrono = "0.4"
 windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
     "Win32_Foundation",
-    "Win32_Media_Audio",
-    "Win32_System_Threading"
+    "Win32_System_Threading",
+    "Win32_System_Registry"
 ] }
 directories = "5.0"
 crossbeam-channel = "0.5"
 arboard = "3.4"
+winreg = "0.52"
+tray-icon = "0.19"
+
 
 

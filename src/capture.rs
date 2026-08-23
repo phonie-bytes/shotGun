@@ -21,7 +21,9 @@ pub struct MonitorInfo {
     pub index: usize,
     pub name: String,
 
+    #[allow(dead_code)]
     pub x: i32,
+    #[allow(dead_code)]
     pub y: i32,
     pub width: u32,
     pub height: u32,
@@ -36,10 +38,13 @@ pub struct CaptureResult {
     pub height: u32,
     pub file_size_bytes: u64,
     pub timestamp: String,
+    #[allow(dead_code)]
     pub monitor_name: String,
     pub counter: u64,
+    #[allow(dead_code)]
     pub session: u64,
 }
+
 
 pub fn get_monitors() -> Vec<MonitorInfo> {
     match Monitor::all() {

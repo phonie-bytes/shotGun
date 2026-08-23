@@ -1,16 +1,32 @@
 # 💡 shotGun - Engineering Lessons & Architecture Insights
 
-This document captures key engineering decisions, architectural trade-offs, and technical lessons learned during the design and implementation of **shotGun**.
+This document captures key engineering decisions, architectural trade-offs, and technical lessons learned during the design and implementation of **shotGun v0.2.0** by **Noerotech**.
 
 ---
 
-## 1. Global Hotkeys: Win32 `RegisterHotKey` vs Low-Level Keyboard Hooks (`WH_KEYBOARD_LL`)
+## 1. System Tray Management in Immediate-Mode GUIs (`egui`)
 
 ### Context
-We needed a global hotkey system that intercepts keystrokes across the entire OS (when the app is minimized or unfocused) without adding latency or lagging gameplay.
+Integrating a persistent background system tray icon with an immediate-mode GUI framework like `egui` / `eframe` requires coordinating window visibility, message queues, and cross-thread event dispatching.
 
-### Decision
-We implemented native Win32 `RegisterHotKey` in a dedicated message pump thread (`PeekMessageW` loop).
+### Key Takeaways
+- Immediate-mode GUIs reconstruct the interface every frame. We decouple the tray handler into a persistent `TrayHandler` holding event receivers (`MenuEvent`, `TrayIconEvent`).
+- Using `ctx.send_viewport_cmd(ViewportCommand::Visible(bool))` and `ViewportCommand::Focus` allows toggling the window smoothly without destroying the renderer state or interrupting ongoing background hotkey listeners.
+
+---
+
+## 2. Windows Startup Registry Integration via `winreg`
+
+### Context
+We needed a seamless way for users to enable/disable auto-start on Windows boot directly within the application without installer scripts or admin permissions.
+
+### Key Takeaways
+- Registering into `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` avoids elevation/UAC requirements.
+- Storing the exact canonical executable path (`std::env::current_exe()`) wrapped in quotes ensures reliable execution even if the folder path contains spaces.
+
+---
+
+## 3. Global Hotkeys: Win32 `RegisterHotKey` vs Low-Level Keyboard Hooks (`WH_KEYBOARD_LL`)
 
 ### Key Takeaways
 - **Performance**: `RegisterHotKey` is managed in the kernel's window manager. It has zero CPU overhead while idle and does not hook into every key event, unlike `SetWindowsHookExW` (`WH_KEYBOARD_LL`) which processes every single keystroke system-wide.
@@ -19,44 +35,9 @@ We implemented native Win32 `RegisterHotKey` in a dedicated message pump thread 
 
 ---
 
-## 2. Multi-Monitor Screen Coordinate Spaces & DPI Scaling
-
-### Context
-Modern setups frequently mix 4K screens (150% DPI scale) with 1080p screens (100% scale), where monitors can be positioned with negative virtual coordinates.
-
-### Decision
-- Decouple **Monitor Capture Coordinates** from **Virtual Desktop Coordinates**.
-- Perform cropping strictly in device physical pixels `(0, 0, physical_width, physical_height)`.
-- Use the egui viewport's `screen_rect` to compute coordinate transformation ratios:
-  ```rust
-  let scale_x = monitor_physical_width as f32 / egui_screen_rect.width();
-  let scale_y = monitor_physical_height as f32 / egui_screen_rect.height();
-  ```
+## 4. Multi-Monitor Coordinate Spaces & Physical DPI Normalization
 
 ### Key Takeaways
 - Never assume 1 logical point equals 1 physical pixel.
 - Freezing the screen into a memory buffer before opening the snipping overlay ensures that fast-moving content (videos, animations) doesn't shift or blur while the user is drawing the region bounding box.
-
----
-
-## 3. High-Throughput Image Encoding and Memory Management
-
-### Context
-Taking bursts of screenshots at high resolutions (4K / 1440p) requires efficient memory allocation and fast disk I/O.
-
-### Decision
-- Used `image::imageops::crop_imm` which avoids duplicating the full image buffer before cropping.
-- Wrapped file output streams in `BufWriter` for buffered disk I/O.
-- Handled color space conversions properly (e.g. converting 4-channel `RgbaImage` to 3-channel `Rgb8` when encoding JPEG).
-
----
-
-## 4. UI State Management with `eframe` / `egui`
-
-### Context
-`egui` is an immediate-mode GUI library. In immediate mode, UI elements do not hold long-term state across frames unless explicitly stored in application structs.
-
-### Key Takeaways
-- Keep transient state (such as combo box selected indices and drag bounding boxes) in the app state.
-- Use `ctx.request_repaint_after(Duration::from_millis(50))` to keep UI responsive to background hotkey events without maxing out CPU frames when idle.
-- Channel communication via `crossbeam-channel` (`try_recv()`) cleanly bridges asynchronous background threads with egui's single-threaded render loop.
+- Local coordinate clamping prevents out-of-bounds panics when dragging beyond the monitor boundary.
