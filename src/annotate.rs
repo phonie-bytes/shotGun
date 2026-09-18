@@ -14,7 +14,19 @@ pub enum Annotation {
     Rectangle { rect: (f32, f32, f32, f32), color: [u8; 4] },
     Highlighter { rect: (f32, f32, f32, f32), color: [u8; 4] },
     Text { pos: (f32, f32), text: String, color: [u8; 4], size: f32 },
-    Blur { rect: (f32, f32, f32, f32) },
+    /// `strength` is 0.0-1.0, controlling the pixelation block size (see
+    /// `draw_pixelate`) — higher means bigger blocks, i.e. more thoroughly
+    /// destroyed detail.
+    Blur { rect: (f32, f32, f32, f32), strength: f32 },
+    /// A fully opaque solid-fill box — for when blur/pixelation isn't
+    /// foolproof enough and the content underneath should be completely
+    /// gone, not just illegible (e.g. redacting a password field outright).
+    Redact { rect: (f32, f32, f32, f32), color: [u8; 4] },
+    /// A numbered badge (for tutorial-style "step 1, step 2, ..." callouts).
+    /// `number` is fixed at the moment it's placed, not recomputed at bake
+    /// time — undoing a step label is what's responsible for handing the
+    /// next click back the same number (see `RegionSelectorOverlay::undo`).
+    StepLabel { pos: (f32, f32), number: u32, color: [u8; 4] },
 }
 
 /// Applies every annotation, in order, onto `image`. Later entries draw on
@@ -26,7 +38,9 @@ pub fn bake(image: &mut RgbaImage, annotations: &[Annotation]) {
             Annotation::Rectangle { rect, color } => draw_rect_border(image, *rect, *color),
             Annotation::Highlighter { rect, color } => draw_highlight(image, *rect, *color),
             Annotation::Text { pos, text, color, size } => draw_text(image, *pos, text, *color, *size),
-            Annotation::Blur { rect } => draw_pixelate(image, *rect),
+            Annotation::Blur { rect, strength } => draw_pixelate(image, *rect, *strength),
+            Annotation::Redact { rect, color } => draw_redact(image, *rect, *color),
+            Annotation::StepLabel { pos, number, color } => draw_step_label(image, *pos, *number, *color),
         }
     }
 }
@@ -93,11 +107,13 @@ fn draw_highlight(image: &mut RgbaImage, rect: (f32, f32, f32, f32), color: [u8;
     }
 }
 
-/// Pixelate (mosaic) the rect: each `BLOCK`x`BLOCK` cell is flattened to its
-/// own average color. More foolproof than a gaussian blur for actually
-/// destroying the readability of redacted text.
-fn draw_pixelate(image: &mut RgbaImage, rect: (f32, f32, f32, f32)) {
-    const BLOCK: u32 = 12;
+/// Pixelate (mosaic) the rect: each block is flattened to its own average
+/// color. More foolproof than a gaussian blur for actually destroying the
+/// readability of redacted text. `strength` (0.0-1.0) controls the block
+/// size — from a light 6px mosaic up to a 40px block that erases almost
+/// all detail — rather than a single fixed size for every use.
+fn draw_pixelate(image: &mut RgbaImage, rect: (f32, f32, f32, f32), strength: f32) {
+    let block = (6.0 + strength.clamp(0.0, 1.0) * 34.0).round() as u32;
     let (w_img, h_img) = image.dimensions();
     let (x0, y0, x1, y1) = normalize_rect(rect);
     let x0 = x0.max(0) as u32;
@@ -110,10 +126,10 @@ fn draw_pixelate(image: &mut RgbaImage, rect: (f32, f32, f32, f32)) {
 
     let mut by = y0;
     while by < y1 {
-        let bh = BLOCK.min(y1 - by);
+        let bh = block.min(y1 - by);
         let mut bx = x0;
         while bx < x1 {
-            let bw = BLOCK.min(x1 - bx);
+            let bw = block.min(x1 - bx);
 
             let mut sum = [0u64; 3];
             let mut count = 0u64;
@@ -139,9 +155,23 @@ fn draw_pixelate(image: &mut RgbaImage, rect: (f32, f32, f32, f32)) {
                     }
                 }
             }
-            bx += BLOCK;
+            bx += block;
         }
-        by += BLOCK;
+        by += block;
+    }
+}
+
+/// A fully opaque solid fill — unlike `draw_highlight` (translucent) or
+/// `draw_pixelate` (mosaic, technically still derived from the original
+/// pixels), this completely replaces the rect's content with a flat color.
+/// For redacting something that must be gone entirely, not just illegible.
+fn draw_redact(image: &mut RgbaImage, rect: (f32, f32, f32, f32), color: [u8; 4]) {
+    let (x0, y0, x1, y1) = normalize_rect(rect);
+    let opaque = [color[0], color[1], color[2], 255];
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            blend_pixel(image, xx, yy, opaque);
+        }
     }
 }
 
@@ -239,6 +269,39 @@ fn draw_text(image: &mut RgbaImage, pos: (f32, f32), text: &str, color: [u8; 4],
         draw_glyph(image, cursor_x, cursor_y, ch, color, scale);
         cursor_x += (6.0 * scale) + scale; // 5px glyph + 1px gap, both scaled
     }
+}
+
+/// A filled circular badge with a centered white number — "step 1, step 2,
+/// ..." callouts for tutorial-style screenshots. `color` is whatever the
+/// annotate toolbar's color picker was set to when this was placed, so
+/// different badges can be different colors just by changing the picker
+/// between placements.
+fn draw_step_label(image: &mut RgbaImage, pos: (f32, f32), number: u32, color: [u8; 4]) {
+    const RADIUS: f32 = 13.0;
+    let (cx, cy) = pos;
+
+    let min_x = (cx - RADIUS).floor() as i32;
+    let max_x = (cx + RADIUS).ceil() as i32;
+    let min_y = (cy - RADIUS).floor() as i32;
+    let max_y = (cy + RADIUS).ceil() as i32;
+    for yy in min_y..=max_y {
+        for xx in min_x..=max_x {
+            let dx = xx as f32 + 0.5 - cx;
+            let dy = yy as f32 + 0.5 - cy;
+            if dx * dx + dy * dy <= RADIUS * RADIUS {
+                blend_pixel(image, xx, yy, color);
+            }
+        }
+    }
+
+    let text = number.to_string();
+    const SIZE: f32 = 16.0;
+    let scale = (SIZE / 8.0).max(1.0);
+    let char_advance = 7.0 * scale; // matches draw_text's own per-char step
+    let text_w = text.chars().count() as f32 * char_advance - scale;
+    let text_h = 7.0 * scale;
+    let text_pos = (cx - text_w / 2.0, cy - text_h / 2.0);
+    draw_text(image, text_pos, &text, [255, 255, 255, 255], SIZE);
 }
 
 fn draw_glyph(image: &mut RgbaImage, x: f32, y: f32, ch: char, color: [u8; 4], scale: f32) {
@@ -356,10 +419,53 @@ mod tests {
     fn draw_pixelate_flattens_block_to_average() {
         let mut img = RgbaImage::from_pixel(24, 24, Rgba([0, 0, 0, 255]));
         img.put_pixel(0, 0, Rgba([255, 255, 255, 255]));
-        bake(&mut img, &[Annotation::Blur { rect: (0.0, 0.0, 12.0, 12.0) }]);
+        bake(&mut img, &[Annotation::Blur { rect: (0.0, 0.0, 12.0, 12.0), strength: 0.5 }]);
         // The single white pixel should have been averaged away within its block.
         let p = img.get_pixel(0, 0);
         assert!(p.0[0] < 255, "expected the block average to dilute the single bright pixel");
+    }
+
+    /// Builds a 40x40 image, dark on the left half and bright on the right.
+    fn half_bright_image() -> RgbaImage {
+        let mut img = RgbaImage::from_pixel(40, 40, Rgba([0, 0, 0, 255]));
+        for y in 0..40 {
+            for x in 20..40 {
+                img.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn draw_pixelate_strength_one_flattens_whole_rect_to_one_color() {
+        let mut img = half_bright_image();
+        bake(&mut img, &[Annotation::Blur { rect: (0.0, 0.0, 40.0, 40.0), strength: 1.0 }]);
+        // At strength 1.0 the block is as big as the whole rect, so it
+        // should all become a single averaged color.
+        let corner = *img.get_pixel(0, 0);
+        let far_corner = *img.get_pixel(39, 39);
+        assert_eq!(corner, far_corner, "a block as big as the whole rect should flatten it to one uniform color");
+        assert!(corner.0[0] > 0 && corner.0[0] < 255, "should be an average of the bright and dark halves, not either extreme");
+    }
+
+    #[test]
+    fn draw_pixelate_low_strength_keeps_some_block_variation() {
+        let mut img = half_bright_image();
+        bake(&mut img, &[Annotation::Blur { rect: (0.0, 0.0, 40.0, 40.0), strength: 0.0 }]);
+        // At strength 0.0 the block is small (6px), so it shouldn't reach
+        // across the whole rect — the dark and bright halves should still
+        // be distinguishable from each other.
+        let dark_side = img.get_pixel(2, 2).0[0];
+        let bright_side = img.get_pixel(38, 2).0[0];
+        assert!(bright_side > dark_side, "small blocks should still preserve the difference between the bright and dark halves");
+    }
+
+    #[test]
+    fn draw_redact_fully_replaces_not_blends() {
+        let mut img = RgbaImage::from_pixel(10, 10, Rgba([200, 200, 200, 255]));
+        bake(&mut img, &[Annotation::Redact { rect: (0.0, 0.0, 5.0, 5.0), color: [10, 10, 10, 255] }]);
+        assert_eq!(*img.get_pixel(2, 2), Rgba([10, 10, 10, 255]), "redaction should fully replace the pixel, not blend with the background");
+        assert_eq!(*img.get_pixel(7, 7), Rgba([200, 200, 200, 255]), "outside the rect should be untouched");
     }
 
     #[test]
@@ -384,5 +490,27 @@ mod tests {
         bake(&mut img, &[Annotation::Text { pos: (2.0, 2.0), text: "A".to_string(), color: [255, 255, 255, 255], size: 8.0 }]);
         let lit = img.pixels().filter(|p| p.0[0] > 0).count();
         assert!(lit > 0, "expected the glyph to light up at least one pixel");
+    }
+
+    #[test]
+    fn draw_step_label_paints_badge_and_number() {
+        let mut img = RgbaImage::from_pixel(40, 40, Rgba([0, 0, 0, 255]));
+        bake(&mut img, &[Annotation::StepLabel { pos: (20.0, 20.0), number: 1, color: [255, 40, 40, 255] }]);
+        // Near the edge of the badge circle: should be the fill color, not background.
+        let edge = img.get_pixel(20, 8);
+        assert_eq!(*edge, Rgba([255, 40, 40, 255]), "expected the badge circle to be filled with its color");
+        // Somewhere in the middle should have picked up white from the number glyph.
+        let center_ish = img.get_pixel(19, 20);
+        assert!(center_ish.0[0] == 255 && center_ish.0[1] == 255, "expected the centered number to be drawn in white");
+    }
+
+    #[test]
+    fn draw_step_label_two_digit_number_stays_roughly_centered() {
+        // Mostly a smoke test that multi-digit numbers don't panic or run
+        // off the badge — exact pixel placement isn't asserted.
+        let mut img = RgbaImage::from_pixel(60, 60, Rgba([0, 0, 0, 255]));
+        bake(&mut img, &[Annotation::StepLabel { pos: (30.0, 30.0), number: 12, color: [0, 120, 255, 255] }]);
+        let lit = img.pixels().filter(|p| p.0[0] > 0 || p.0[1] > 0 || p.0[2] > 0).count();
+        assert!(lit > 0);
     }
 }

@@ -242,19 +242,15 @@ impl ShotgunApp {
     /// Finishes a Quick Region Capture that went through the annotate
     /// toolbar: `image` is already cropped to `region`'s size and already
     /// has the user's annotations baked in — no screen re-capture needed.
-    /// `copy_only` (the toolbar's "📋 Copy" action) skips the disk write
-    /// entirely; otherwise this mirrors `do_capture()`'s bookkeeping
-    /// (naming/counter via `save_captured_image`, history, status message,
-    /// and the `auto_copy_to_clipboard` setting).
-    fn finish_annotated_capture(&mut self, image: image::RgbaImage, copy_only: bool) {
-        if copy_only {
-            self.status_message = match Self::copy_image_data_to_clipboard(&image) {
-                Ok(()) => "📋 Annotated screenshot copied to clipboard.".to_string(),
-                Err(e) => format!("⚠️ Clipboard copy failed: {e}"),
-            };
-            return;
-        }
-
+    /// Always saves to disk and lands in History, whether this came from
+    /// "Save" or "Copy" — "Copy" being clipboard-only with no disk write
+    /// and no History entry was the *only* place in the app where copying
+    /// didn't also mean saving, which was more surprising than useful.
+    /// `explicit_copy` (the toolbar's "📋 Copy" action) means "copy to
+    /// clipboard regardless of the `auto_copy_to_clipboard` setting" — the
+    /// rest of this mirrors `do_capture()`'s bookkeeping (naming/counter
+    /// via `save_captured_image`, history, status message).
+    fn finish_annotated_capture(&mut self, image: image::RgbaImage, explicit_copy: bool) {
         let monitor_name = self
             .monitors
             .get(self.config.monitor_index)
@@ -271,7 +267,7 @@ impl ShotgunApp {
                     result.file_path.file_name().unwrap_or_default().to_string_lossy(),
                     width = self.config.padding_digits
                 );
-                if self.config.auto_copy_to_clipboard {
+                if explicit_copy || self.config.auto_copy_to_clipboard {
                     match Self::copy_image_data_to_clipboard(&image) {
                         Ok(()) => msg.push_str(" (copied to clipboard)"),
                         Err(e) => msg.push_str(&format!(" (clipboard copy failed: {e})")),
@@ -966,14 +962,14 @@ impl eframe::App for ShotgunApp {
                 self.pending_quick_capture = false;
                 self.restore_window_after_overlay(ctx);
             }
-            OverlayAction::Annotated { image, region, copy_only } => {
+            OverlayAction::Annotated { image, region, explicit_copy } => {
                 self.config.region = Some(region);
                 let _ = self.config.save();
                 // Already handled via the annotate toolbar's Save/Copy —
                 // don't also let the pending Quick Capture auto-fire a
                 // plain do_capture() once the window finishes restoring.
                 self.pending_quick_capture = false;
-                self.finish_annotated_capture(image, copy_only);
+                self.finish_annotated_capture(image, explicit_copy);
                 self.restore_window_after_overlay(ctx);
             }
             OverlayAction::None => {}

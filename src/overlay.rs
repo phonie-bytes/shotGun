@@ -9,20 +9,24 @@ pub enum OverlayAction {
     Confirmed(RectRegion),
     Cancelled,
     /// A quick-capture annotate session finished: the already-baked,
-    /// already-cropped image ready to be saved/copied by the caller.
-    /// `copy_only` is true for the toolbar's "Copy" action (clipboard only,
-    /// no disk write) and false for "Save" (disk write, plus clipboard too
-    /// if the app's own `auto_copy_to_clipboard` setting is on).
-    Annotated { image: RgbaImage, region: RectRegion, copy_only: bool },
+    /// already-cropped image ready to be saved by the caller (always saved
+    /// to disk and added to History, whichever toolbar button triggered
+    /// this — "Copy" isn't a disk-free path, it's "Save" plus an explicit
+    /// clipboard copy, matching how copying works everywhere else in the
+    /// app). `explicit_copy` is true for the toolbar's "Copy" action, so
+    /// the caller knows to copy even if `auto_copy_to_clipboard` is off.
+    Annotated { image: RgbaImage, region: RectRegion, explicit_copy: bool },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tool {
     Arrow,
     Rectangle,
     Highlighter,
     Text,
     Blur,
+    Redact,
+    StepLabel,
 }
 
 #[derive(PartialEq, Eq)]
@@ -62,6 +66,17 @@ pub struct RegionSelectorOverlay {
     current_tool: Tool,
     current_color: Color32,
     pending_text: Option<PendingText>,
+    /// The number the *next* Step Label placement will use. Starts at 1 for
+    /// each new overlay session; incremented on placement, decremented by
+    /// `undo()` if the annotation being undone was itself a step label, so
+    /// undo-then-replace hands back the same number rather than skipping
+    /// ahead.
+    next_step_number: u32,
+    /// 0.0-1.0, the Blur tool's pixelation strength — shown as a 0-100%
+    /// slider in the toolbar (see `annotate::draw_pixelate`). Defaults
+    /// higher than the tool's old fixed block size, which wasn't
+    /// aggressive enough to reliably destroy small text.
+    current_blur_strength: f32,
 }
 
 impl Default for RegionSelectorOverlay {
@@ -82,6 +97,8 @@ impl Default for RegionSelectorOverlay {
             current_tool: Tool::Arrow,
             current_color: Color32::from_rgb(255, 40, 40),
             pending_text: None,
+            next_step_number: 1,
+            current_blur_strength: 0.65,
         }
     }
 }
@@ -125,6 +142,7 @@ impl RegionSelectorOverlay {
         self.annotations.clear();
         self.current_tool = Tool::Arrow;
         self.pending_text = None;
+        self.next_step_number = 1;
 
         Ok(())
     }
@@ -139,6 +157,17 @@ impl RegionSelectorOverlay {
         self.confirmed_region = None;
         self.annotations.clear();
         self.pending_text = None;
+    }
+
+    /// Removes the most recently placed annotation. If it was a Step
+    /// Label, also hands its number back to `next_step_number`, so
+    /// undo-then-place-again reuses the same number rather than skipping
+    /// ahead of the one that was just undone.
+    fn undo(&mut self) {
+        if let Some(Annotation::StepLabel { .. }) = self.annotations.last() {
+            self.next_step_number = self.next_step_number.saturating_sub(1).max(1);
+        }
+        self.annotations.pop();
     }
 
     pub fn show(&mut self, ctx: &Context) -> OverlayAction {
@@ -211,6 +240,13 @@ impl RegionSelectorOverlay {
                             if self.annotate_after_select {
                                 self.confirmed_region = Some(region);
                                 self.mode = Mode::Annotating;
+                                // Clear the selection drag's own start/current —
+                                // otherwise show_annotating's "in-progress drag"
+                                // preview immediately draws a stale line between
+                                // these leftover points before any real
+                                // annotation drag has happened.
+                                self.start_pos = None;
+                                self.current_pos = None;
                                 // Stay active; annotate mode takes over next frame.
                             } else {
                                 self.close();
@@ -378,9 +414,9 @@ impl RegionSelectorOverlay {
     }
 
     /// Crops the frozen raw image to `region`, bakes `self.annotations`
-    /// into it, and closes the overlay. `copy_only` is threaded straight
-    /// into the returned `OverlayAction` for the caller to act on.
-    fn finish_annotated(&mut self, copy_only: bool) -> OverlayAction {
+    /// into it, and closes the overlay. `explicit_copy` is threaded
+    /// straight into the returned `OverlayAction` for the caller to act on.
+    fn finish_annotated(&mut self, explicit_copy: bool) -> OverlayAction {
         let Some(region) = self.confirmed_region else {
             self.close();
             return OverlayAction::Cancelled;
@@ -394,7 +430,7 @@ impl RegionSelectorOverlay {
         annotate::bake(&mut cropped, &self.annotations);
 
         self.close();
-        OverlayAction::Annotated { image: cropped, region, copy_only }
+        OverlayAction::Annotated { image: cropped, region, explicit_copy }
     }
 
     fn show_annotating(&mut self, ctx: &Context) -> OverlayAction {
@@ -406,13 +442,13 @@ impl RegionSelectorOverlay {
         };
 
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Z)) {
-            self.annotations.pop();
+            self.undo();
         }
         // Ctrl+S / Ctrl+Shift+S mirror the toolbar's Save/Copy buttons, for
         // anyone who'd rather not reach for the mouse mid-annotation.
         if self.pending_text.is_none() && ctx.input(|i| i.key_pressed(Key::S) && i.modifiers.ctrl) {
-            let copy_only = ctx.input(|i| i.modifiers.shift);
-            return self.finish_annotated(copy_only);
+            let explicit_copy = ctx.input(|i| i.modifiers.shift);
+            return self.finish_annotated(explicit_copy);
         }
         // Number keys switch tools without reaching for the toolbar —
         // standard UX for annotation/drawing tools. Ignored while typing an
@@ -424,6 +460,8 @@ impl RegionSelectorOverlay {
                 if i.key_pressed(Key::Num3) { self.current_tool = Tool::Highlighter; }
                 if i.key_pressed(Key::Num4) { self.current_tool = Tool::Text; }
                 if i.key_pressed(Key::Num5) { self.current_tool = Tool::Blur; }
+                if i.key_pressed(Key::Num6) { self.current_tool = Tool::StepLabel; }
+                if i.key_pressed(Key::Num7) { self.current_tool = Tool::Redact; }
             });
         }
 
@@ -505,6 +543,20 @@ impl RegionSelectorOverlay {
                             });
                         }
                     }
+                } else if self.current_tool == Tool::StepLabel {
+                    // Click-to-place, like Text — a badge doesn't have a
+                    // "drag out a size," it's just a point, so a normal
+                    // click reads more naturally here than a drag.
+                    if response.clicked() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            self.annotations.push(Annotation::StepLabel {
+                                pos: to_region_local(pos),
+                                number: self.next_step_number,
+                                color: self.current_color.to_array(),
+                            });
+                            self.next_step_number += 1;
+                        }
+                    }
                 } else {
                     if response.drag_started() {
                         self.start_pos = response.interact_pointer_pos();
@@ -523,8 +575,9 @@ impl RegionSelectorOverlay {
                                     Tool::Arrow => Some(Annotation::Arrow { start: sl, end: el, color }),
                                     Tool::Rectangle => Some(Annotation::Rectangle { rect: rect_from_local(sl, el), color }),
                                     Tool::Highlighter => Some(Annotation::Highlighter { rect: rect_from_local(sl, el), color }),
-                                    Tool::Blur => Some(Annotation::Blur { rect: rect_from_local(sl, el) }),
-                                    Tool::Text => None,
+                                    Tool::Blur => Some(Annotation::Blur { rect: rect_from_local(sl, el), strength: self.current_blur_strength }),
+                                    Tool::Redact => Some(Annotation::Redact { rect: rect_from_local(sl, el), color }),
+                                    Tool::Text | Tool::StepLabel => None,
                                 };
                                 if let Some(a) = ann {
                                     self.annotations.push(a);
@@ -546,6 +599,7 @@ impl RegionSelectorOverlay {
                     match self.current_tool {
                         Tool::Arrow => {
                             painter.line_segment([s, e], Stroke::new(3.0, self.current_color));
+                            draw_arrowhead_preview(painter, s, e, self.current_color);
                         }
                         Tool::Rectangle => {
                             painter.rect_stroke(Rect::from_two_pos(s, e), 0.0, Stroke::new(2.0, self.current_color));
@@ -556,7 +610,10 @@ impl RegionSelectorOverlay {
                         Tool::Blur => {
                             painter.rect_filled(Rect::from_two_pos(s, e), 0.0, Color32::from_gray(128).gamma_multiply(0.5));
                         }
-                        Tool::Text => {}
+                        Tool::Redact => {
+                            painter.rect_filled(Rect::from_two_pos(s, e), 0.0, self.current_color);
+                        }
+                        Tool::Text | Tool::StepLabel => {}
                     }
                 }
 
@@ -590,43 +647,63 @@ impl RegionSelectorOverlay {
                     self.pending_text = None;
                 }
 
-                // Toolbar.
-                egui::Area::new(egui::Id::new("annotate_toolbar"))
+                // Toolbar. Forced to the top of the Foreground layer stack
+                // every frame via `move_to_top` below — otherwise, once the
+                // drawing region underneath (also Order::Foreground) gets
+                // raised by the user's own drag interaction on it, this
+                // toolbar can end up buried behind it, and its buttons stop
+                // receiving clicks even though they're still visibly on top.
+                let toolbar_id = egui::Id::new("annotate_toolbar");
+                egui::Area::new(toolbar_id)
                     .fixed_pos(Pos2::new(screen_rect.min.x + 12.0, screen_rect.min.y + 12.0))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(&mut self.current_tool, Tool::Arrow, "➡ Arrow").on_hover_text("1");
-                                ui.selectable_value(&mut self.current_tool, Tool::Rectangle, "▭ Rect").on_hover_text("2");
-                                ui.selectable_value(&mut self.current_tool, Tool::Highlighter, "🖍 Highlight").on_hover_text("3");
-                                ui.selectable_value(&mut self.current_tool, Tool::Text, "🔤 Text").on_hover_text("4");
-                                ui.selectable_value(&mut self.current_tool, Tool::Blur, "🌫 Blur").on_hover_text("5");
-                                ui.separator();
-                                if self.current_tool != Tool::Blur {
-                                    ui.color_edit_button_srgba(&mut self.current_color);
-                                }
-                                ui.separator();
-                                if ui.button("↩ Undo").on_hover_text("Ctrl+Z").clicked() {
-                                    self.annotations.pop();
-                                }
-                                if ui.button("🗑 Clear").clicked() {
-                                    self.annotations.clear();
-                                }
-                                ui.separator();
-                                if ui.button(egui::RichText::new("💾 Save").strong()).clicked() {
-                                    result = self.finish_annotated(false);
-                                }
-                                if ui.button("📋 Copy").clicked() {
-                                    result = self.finish_annotated(true);
-                                }
-                                if ui.button("❌ Cancel").clicked() {
-                                    self.close();
-                                    result = OverlayAction::Cancelled;
-                                }
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut self.current_tool, Tool::Arrow, "➡ Arrow").on_hover_text("1");
+                                    ui.selectable_value(&mut self.current_tool, Tool::Rectangle, "▭ Rect").on_hover_text("2");
+                                    ui.selectable_value(&mut self.current_tool, Tool::Highlighter, "🖍 Highlight").on_hover_text("3");
+                                    ui.selectable_value(&mut self.current_tool, Tool::Text, "🔤 Text").on_hover_text("4");
+                                    ui.selectable_value(&mut self.current_tool, Tool::Blur, "🌫 Blur").on_hover_text("5");
+                                    ui.selectable_value(&mut self.current_tool, Tool::Redact, "⬛ Redact").on_hover_text("7");
+                                    ui.selectable_value(&mut self.current_tool, Tool::StepLabel, "① Step").on_hover_text("6");
+                                });
+                                ui.horizontal(|ui| {
+                                    if self.current_tool == Tool::Blur {
+                                        ui.label("Strength:");
+                                        ui.add(
+                                            egui::Slider::new(&mut self.current_blur_strength, 0.0..=1.0)
+                                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                                .custom_parser(|s| s.trim_end_matches('%').parse::<f64>().ok().map(|p| p / 100.0)),
+                                        ).on_hover_text("Bigger pixelation blocks destroy more detail. If text is still readable, raise this.");
+                                    } else {
+                                        ui.color_edit_button_srgba(&mut self.current_color);
+                                    }
+                                    ui.separator();
+                                    if ui.button("↩ Undo").on_hover_text("Ctrl+Z").clicked() {
+                                        self.undo();
+                                    }
+                                    if ui.button("🗑 Clear").clicked() {
+                                        self.annotations.clear();
+                                        self.next_step_number = 1;
+                                    }
+                                    ui.separator();
+                                    if ui.button(egui::RichText::new("💾 Save").strong()).clicked() {
+                                        result = self.finish_annotated(false);
+                                    }
+                                    if ui.button("📋 Copy").clicked() {
+                                        result = self.finish_annotated(true);
+                                    }
+                                    if ui.button("❌ Cancel").clicked() {
+                                        self.close();
+                                        result = OverlayAction::Cancelled;
+                                    }
+                                });
                             });
                         });
                     });
+                ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, toolbar_id));
             });
 
         result
@@ -662,8 +739,9 @@ fn draw_annotation_preview(painter: &egui::Painter, ann: &Annotation, to_screen:
         Annotation::Arrow { start, end, color } => {
             let s = to_screen(*start);
             let e = to_screen(*end);
-            painter.line_segment([s, e], Stroke::new(3.0, color32_from(*color)));
-            painter.circle_filled(e, 4.0, color32_from(*color));
+            let c = color32_from(*color);
+            painter.line_segment([s, e], Stroke::new(3.0, c));
+            draw_arrowhead_preview(painter, s, e, c);
         }
         Annotation::Rectangle { rect, color } => {
             let r = local_rect_to_screen(*rect, &to_screen);
@@ -673,13 +751,22 @@ fn draw_annotation_preview(painter: &egui::Painter, ann: &Annotation, to_screen:
             let r = local_rect_to_screen(*rect, &to_screen);
             painter.rect_filled(r, 0.0, color32_from(*color).gamma_multiply(0.35));
         }
-        Annotation::Blur { rect } => {
+        Annotation::Blur { rect, .. } => {
             let r = local_rect_to_screen(*rect, &to_screen);
             painter.rect_filled(r, 0.0, Color32::from_gray(128).gamma_multiply(0.5));
+        }
+        Annotation::Redact { rect, color } => {
+            let r = local_rect_to_screen(*rect, &to_screen);
+            painter.rect_filled(r, 0.0, color32_from(*color));
         }
         Annotation::Text { pos, text, color, size } => {
             let p = to_screen(*pos);
             painter.text(p, egui::Align2::LEFT_TOP, text, egui::FontId::proportional(*size), color32_from(*color));
+        }
+        Annotation::StepLabel { pos, number, color } => {
+            let p = to_screen(*pos);
+            painter.circle_filled(p, 13.0, color32_from(*color));
+            painter.text(p, egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::proportional(14.0), Color32::WHITE);
         }
     }
 }
@@ -699,4 +786,25 @@ fn local_rect_to_screen(rect: (f32, f32, f32, f32), to_screen: &impl Fn((f32, f3
 
 fn color32_from(c: [u8; 4]) -> Color32 {
     Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
+}
+
+/// Draws a filled triangular arrowhead at `end`, pointing along the
+/// `start -> end` direction — mirrors (visually, not pixel-for-pixel)
+/// `annotate::draw_arrow`'s real arrowhead, so the live preview actually
+/// looks like an arrow rather than a line with a dot on the end.
+fn draw_arrowhead_preview(painter: &egui::Painter, start: Pos2, end: Pos2, color: Color32) {
+    let dir = end - start;
+    let len = dir.length();
+    if len < 0.001 {
+        return;
+    }
+    let u = dir / len;
+    let perp = Vec2::new(-u.y, u.x);
+    const HEAD_LEN: f32 = 14.0;
+    const HEAD_WIDTH: f32 = 9.0;
+    let head_len = HEAD_LEN.min(len);
+    let back = end - u * head_len;
+    let p1 = back + perp * HEAD_WIDTH;
+    let p2 = back - perp * HEAD_WIDTH;
+    painter.add(egui::Shape::convex_polygon(vec![end, p1, p2], color, Stroke::NONE));
 }
