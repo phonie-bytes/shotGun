@@ -18,6 +18,8 @@ use egui::{
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
@@ -34,7 +36,7 @@ pub struct ShotgunApp {
     pub monitors: Vec<MonitorInfo>,
     pub hotkey_manager: HotkeyManager,
     pub hotkey_rx: Receiver<HotkeyEvent>,
-    pub hotkey_status: (bool, bool, bool, bool, bool),
+    pub hotkey_status: (bool, bool, bool, bool, bool, bool),
     pub hotkey_error: Option<String>,
     pub active_tab: ActiveTab,
     pub history: Vec<CaptureResult>,
@@ -48,6 +50,19 @@ pub struct ShotgunApp {
     /// drag-select overlay, so the move/resize/overlay-start can happen on
     /// the frame after decorations actually take effect.
     pub pending_fullscreen_overlay: Option<usize>,
+    /// Set for exactly one frame after the approximate move onto the
+    /// target monitor, so real OS fullscreen can be requested once that
+    /// move has actually settled.
+    pub pending_fullscreen_enter: Option<usize>,
+    /// Set for exactly one frame while restoring the window after a
+    /// drag-select overlay, so the inner-size restore can happen once the
+    /// position move back to the origin monitor has settled.
+    pub pending_restore_size: Option<egui::Vec2>,
+    /// Set while a drag-select overlay was started by the Quick Region
+    /// Capture hotkey (rather than the manual "Drag-Select ROI" button), so
+    /// a capture fires automatically once the region is confirmed and the
+    /// window has fully restored — no separate Capture press needed.
+    pub pending_quick_capture: bool,
     pub tray_handler: Option<TrayHandler>,
     pub window_visible: bool,
     pub autostart_state: bool,
@@ -60,6 +75,8 @@ pub struct ShotgunApp {
     pub temp_video_stop_key_idx: usize,
     // Show/Hide window hotkey temp state
     pub temp_toggle_window_key_idx: usize,
+    // Quick Region Capture hotkey temp state
+    pub temp_quick_capture_key_idx: usize,
     // Video capture handle
     pub video_handle: Option<video::VideoHandle>,
     pub video_result_rx: Option<Receiver<video::VideoResult>>,
@@ -108,14 +125,19 @@ impl ShotgunApp {
             .iter()
             .position(|k| k.vk_code == config.toggle_window_hotkey.vk_code)
             .unwrap_or(12); // Default Insert
+        let temp_quick_capture_key_idx = AVAILABLE_KEYS
+            .iter()
+            .position(|k| k.vk_code == config.quick_capture_hotkey.vk_code)
+            .unwrap_or(13); // Default Home
 
-        // Initialize hotkey manager with all five hotkeys
+        // Initialize hotkey manager with all six hotkeys
         let (hotkey_manager, hotkey_rx) = HotkeyManager::new(
             config.capture_hotkey.clone(),
             config.new_session_hotkey.clone(),
             config.video_start_hotkey.clone(),
             config.video_stop_hotkey.clone(),
             config.toggle_window_hotkey.clone(),
+            config.quick_capture_hotkey.clone(),
         );
 
         let tray_handler = TrayHandler::new().ok();
@@ -133,7 +155,7 @@ impl ShotgunApp {
             monitors,
             hotkey_manager,
             hotkey_rx,
-            hotkey_status: (false, false, false, false, false),
+            hotkey_status: (false, false, false, false, false, false),
             hotkey_error: None,
             active_tab: ActiveTab::ScreenRegion,
             history: Vec::new(),
@@ -141,6 +163,9 @@ impl ShotgunApp {
             overlay: RegionSelectorOverlay::new(),
             overlay_saved_window: None,
             pending_fullscreen_overlay: None,
+            pending_fullscreen_enter: None,
+            pending_restore_size: None,
+            pending_quick_capture: false,
             tray_handler,
             window_visible: true,
             autostart_state,
@@ -150,6 +175,7 @@ impl ShotgunApp {
             temp_video_start_key_idx,
             temp_video_stop_key_idx,
             temp_toggle_window_key_idx,
+            temp_quick_capture_key_idx,
             video_handle: None,
             video_result_rx: None,
             // session modal state
@@ -356,6 +382,43 @@ impl ShotgunApp {
         }
     }
 
+    /// Finds which configured monitor currently contains the mouse cursor,
+    /// comparing against each `MonitorInfo`'s physical-pixel virtual-desktop
+    /// bounds (`x`/`y`/`width`/`height`), which is the same coordinate space
+    /// `GetCursorPos` reports in.
+    fn monitor_index_at_cursor(&self) -> Option<usize> {
+        let mut point = POINT { x: 0, y: 0 };
+        let ok = unsafe { GetCursorPos(&mut point) };
+        if ok == 0 {
+            return None;
+        }
+        self.monitors.iter().position(|m| {
+            point.x >= m.x
+                && point.x < m.x + m.width as i32
+                && point.y >= m.y
+                && point.y < m.y + m.height as i32
+        })
+    }
+
+    /// Hotkey entry point for "Quick Region Capture": snip on whichever
+    /// monitor the mouse is currently on, then capture immediately once the
+    /// region is confirmed, instead of leaving the picked region as a saved
+    /// setting for some later, separate Capture press.
+    fn trigger_quick_region_capture(&mut self, ctx: &Context) {
+        let Some(monitor_index) = self.monitor_index_at_cursor() else {
+            self.status_message = "Couldn't determine which monitor the cursor is on.".to_string();
+            return;
+        };
+
+        if self.config.monitor_index != monitor_index {
+            self.config.monitor_index = monitor_index;
+            let _ = self.config.save();
+        }
+
+        self.start_drag_select_overlay(ctx);
+        self.pending_quick_capture = true;
+    }
+
     /// Kicks off expanding the app's own window into a borderless overlay
     /// covering the *actual* target monitor at (close to) 1:1 scale, then
     /// starting the freeze-frame drag-select. Without this, dragging happens
@@ -381,10 +444,24 @@ impl ShotgunApp {
             // InnerSize is content size excluding chrome. Using outer size
             // there would add the title-bar/border thickness on top of
             // itself every time this overlay is used, growing the window.
+            //
+            // Stored as *physical pixels*, not points: points are only
+            // meaningful relative to whatever scale factor is active when
+            // they're later sent as a command, which may well be a
+            // different monitor's scale by restore time on a mixed-DPI
+            // setup. Physical pixels stay correct regardless of which
+            // monitor's DPI context is currently active.
+            let live_scale = ctx
+                .input(|i| i.viewport().native_pixels_per_point)
+                .unwrap_or(1.0)
+                .max(0.01);
             let outer_pos = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
             let inner_size = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
             if let (Some(pos), Some(size)) = (outer_pos, inner_size) {
-                self.overlay_saved_window = Some((pos, size));
+                self.overlay_saved_window = Some((
+                    egui::Pos2::new(pos.x * live_scale, pos.y * live_scale),
+                    egui::Vec2::new(size.x * live_scale, size.y * live_scale),
+                ));
             }
         }
 
@@ -392,9 +469,23 @@ impl ShotgunApp {
         self.pending_fullscreen_overlay = Some(self.config.monitor_index);
     }
 
-    /// Second half of `start_drag_select_overlay`, run on the frame after
-    /// decorations were dropped: move/resize the (now borderless) window
-    /// over the target monitor and start the freeze-frame capture.
+    /// Second phase of `start_drag_select_overlay`, run on the frame after
+    /// decorations were dropped: nudges the window's *position* roughly
+    /// onto the target monitor. This deliberately does **not** try to also
+    /// compute the right *size* here — chasing the correct points-to-pixels
+    /// conversion by hand across a monitor boundary (dividing by whichever
+    /// scale factor is "current," re-reading it after settling, etc.) kept
+    /// racing winit/Windows' own DPI-context updates in subtle ways: a
+    /// position move can itself flip the active scale factor before a size
+    /// command sent in the same or a following frame gets applied, so the
+    /// size ends up scaled by a factor that didn't apply when it was
+    /// computed. Rather than fight that, the actual full-monitor sizing is
+    /// handed to real OS fullscreen (`apply_pending_fullscreen_enter`),
+    /// which snaps to whatever monitor the window ends up on using its own
+    /// correct, native scale handling — no manual pixel/point math at all.
+    /// The position here only needs to be *roughly* right (get the window's
+    /// top-left onto the destination monitor), since fullscreen mode
+    /// ignores the window's prior size entirely.
     fn apply_pending_fullscreen_overlay(&mut self, ctx: &Context) {
         let Some(monitor_index) = self.pending_fullscreen_overlay.take() else {
             return;
@@ -404,12 +495,33 @@ impl ShotgunApp {
             return;
         };
 
-        let scale = mon.scale_factor.max(0.01);
-        let pos = egui::Pos2::new(mon.x as f32 / scale, mon.y as f32 / scale);
-        let size = egui::Vec2::new(mon.width as f32 / scale, mon.height as f32 / scale);
+        let current_scale = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(mon.scale_factor)
+            .max(0.01);
+        let pos = egui::Pos2::new(mon.x as f32 / current_scale, mon.y as f32 / current_scale);
 
         ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+
+        self.pending_fullscreen_enter = Some(monitor_index);
+    }
+
+    /// Third phase: now that the window has (approximately) landed on the
+    /// target monitor, ask the OS to make it real borderless fullscreen —
+    /// Windows resolves the exact size against whatever monitor the window
+    /// is actually on and its real scale factor, natively, so there's
+    /// nothing left for us to compute by hand. Then start the freeze-frame
+    /// capture.
+    fn apply_pending_fullscreen_enter(&mut self, ctx: &Context) {
+        let Some(monitor_index) = self.pending_fullscreen_enter.take() else {
+            return;
+        };
+        if self.monitors.get(monitor_index).is_none() {
+            self.restore_window_after_overlay(ctx);
+            return;
+        }
+
+        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
 
         if let Err(e) = self.overlay.start(ctx, monitor_index) {
@@ -418,14 +530,59 @@ impl ShotgunApp {
         }
     }
 
-    /// Restores the app window's normal size/position/decorations after a
+    /// Restores the app window's normal position/decorations after a
     /// drag-select overlay (started by `start_drag_select_overlay`) closes.
+    /// `overlay_saved_window` holds *physical pixels* (see
+    /// `start_drag_select_overlay`), converted to points here using
+    /// whatever scale factor is active right now — the overlay's target
+    /// monitor, since the window hasn't moved back yet. The size restore is
+    /// deferred one frame — see `apply_pending_restore_size` — for the same
+    /// cross-monitor DPI settling reason the launch sequence defers its own
+    /// resize: applying it correctly requires the window to have actually
+    /// finished moving back to the origin monitor first; doing both in the
+    /// same batch races that.
     fn restore_window_after_overlay(&mut self, ctx: &Context) {
-        if let Some((pos, size)) = self.overlay_saved_window.take() {
+        // Always safe to send, even if we never actually reached real
+        // fullscreen (e.g. the overlay errored before `apply_pending_fullscreen_enter`
+        // ran) — turning off fullscreen when it's already off is a no-op.
+        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+
+        if let Some((pos_px, size_px)) = self.overlay_saved_window.take() {
+            let current_scale = ctx
+                .input(|i| i.viewport().native_pixels_per_point)
+                .unwrap_or(1.0)
+                .max(0.01);
+            let pos = egui::Pos2::new(pos_px.x / current_scale, pos_px.y / current_scale);
+
             ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
-            ctx.send_viewport_cmd(ViewportCommand::Focus);
+            self.pending_restore_size = Some(size_px);
+        }
+    }
+
+    /// Second half of `restore_window_after_overlay`: applies the saved
+    /// (physical-pixel) inner size, converted to points using whatever
+    /// scale factor is active now that the position move back has had a
+    /// frame to settle onto the origin monitor. If this restore followed a
+    /// Quick Region Capture (`pending_quick_capture`), the window has by
+    /// now moved off the target monitor — safe to take the actual
+    /// screenshot without our own overlay chrome being in it.
+    fn apply_pending_restore_size(&mut self, ctx: &Context) {
+        let Some(size_px) = self.pending_restore_size.take() else {
+            return;
+        };
+        let current_scale = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0)
+            .max(0.01);
+        let size = egui::Vec2::new(size_px.x / current_scale, size_px.y / current_scale);
+
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+
+        if self.pending_quick_capture {
+            self.pending_quick_capture = false;
+            self.do_capture();
         }
     }
 
@@ -473,6 +630,10 @@ impl ShotgunApp {
         self.config.toggle_window_hotkey.vk_code = toggle_key.vk_code;
         self.config.toggle_window_hotkey.key_name = toggle_key.name.to_string();
 
+        let quick_capture_key = &AVAILABLE_KEYS[self.temp_quick_capture_key_idx];
+        self.config.quick_capture_hotkey.vk_code = quick_capture_key.vk_code;
+        self.config.quick_capture_hotkey.key_name = quick_capture_key.name.to_string();
+
         let _ = self.config.save();
 
         self.hotkey_manager.update_hotkeys(
@@ -481,6 +642,7 @@ impl ShotgunApp {
             self.config.video_start_hotkey.clone(),
             self.config.video_stop_hotkey.clone(),
             self.config.toggle_window_hotkey.clone(),
+            self.config.quick_capture_hotkey.clone(),
         );
 
         self.status_message = format!(
@@ -563,15 +725,19 @@ impl eframe::App for ShotgunApp {
                 HotkeyEvent::Triggered(HotkeyAction::ToggleWindow) => {
                     self.toggle_window_visibility(ctx);
                 }
+                HotkeyEvent::Triggered(HotkeyAction::QuickCapture) => {
+                    self.trigger_quick_region_capture(ctx);
+                }
                 HotkeyEvent::RegisteredStatus {
                     capture_ok,
                     new_session_ok,
                     video_start_ok,
                     video_stop_ok,
                     toggle_window_ok,
+                    quick_capture_ok,
                     error_msg,
                 } => {
-                    self.hotkey_status = (capture_ok, new_session_ok, video_start_ok, video_stop_ok, toggle_window_ok);
+                    self.hotkey_status = (capture_ok, new_session_ok, video_start_ok, video_stop_ok, toggle_window_ok, quick_capture_ok);
                     self.hotkey_error = error_msg;
                 }
             }
@@ -580,6 +746,8 @@ impl eframe::App for ShotgunApp {
         // 3. Complete any drag-select overlay whose window decorations were
         //    just dropped last frame, now that the resize can actually stick.
         self.apply_pending_fullscreen_overlay(ctx);
+        self.apply_pending_fullscreen_enter(ctx);
+        self.apply_pending_restore_size(ctx);
 
         // 4. Render Full-Screen Snipping Overlay if Active
         match self.overlay.show(ctx) {
@@ -594,6 +762,7 @@ impl eframe::App for ShotgunApp {
             }
             OverlayAction::Cancelled => {
                 self.status_message = "Selection cancelled.".to_string();
+                self.pending_quick_capture = false;
                 self.restore_window_after_overlay(ctx);
             }
             OverlayAction::None => {}
@@ -613,8 +782,8 @@ impl eframe::App for ShotgunApp {
                 ui.separator();
 
                 // Hotkey status badge
-                let (cap_ok, sess_ok, vid_start_ok, vid_stop_ok, toggle_ok) = self.hotkey_status;
-                if cap_ok && sess_ok && vid_start_ok && vid_stop_ok && toggle_ok {
+                let (cap_ok, sess_ok, vid_start_ok, vid_stop_ok, toggle_ok, quick_capture_ok) = self.hotkey_status;
+                if cap_ok && sess_ok && vid_start_ok && vid_stop_ok && toggle_ok && quick_capture_ok {
                     ui.label(RichText::new("🟢 Active").size(11.0).color(Color32::from_rgb(70, 220, 100)));
                 } else {
                     let err = self.hotkey_error.as_deref().unwrap_or("Binding error");
@@ -1051,6 +1220,40 @@ impl ShotgunApp {
             ui.label(RichText::new(format!("Current: [{toggle_str}]")).strong().color(Color32::from_rgb(0, 220, 255)));
         });
 
+        ui.add_space(8.0);
+
+        // Quick Region Capture Hotkey Box
+        ui.group(|ui| {
+            ui.strong(RichText::new("🎯 Quick Region Capture Hotkey").size(14.0));
+            ui.label(RichText::new("Opens the drag-select overlay on whichever monitor your mouse is currently on, then captures immediately once you release the drag — no separate Capture press needed.").size(10.5).color(Color32::GRAY));
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.config.quick_capture_hotkey.ctrl, "Ctrl");
+                ui.checkbox(&mut self.config.quick_capture_hotkey.alt, "Alt");
+                ui.checkbox(&mut self.config.quick_capture_hotkey.shift, "Shift");
+                ui.checkbox(&mut self.config.quick_capture_hotkey.win, "Win");
+
+                ui.separator();
+                ui.label("Key:");
+                let current_quick_capture_key = AVAILABLE_KEYS[self.temp_quick_capture_key_idx].name;
+                egui::ComboBox::from_id_salt("combo_quick_capture_key")
+                    .selected_text(current_quick_capture_key)
+                    .show_ui(ui, |ui| {
+                        for (idx, key) in AVAILABLE_KEYS.iter().enumerate() {
+                            ui.selectable_value(&mut self.temp_quick_capture_key_idx, idx, key.name);
+                        }
+                    });
+            });
+
+            let quick_capture_str = {
+                let mut temp = self.config.quick_capture_hotkey.clone();
+                temp.key_name = AVAILABLE_KEYS[self.temp_quick_capture_key_idx].name.to_string();
+                temp.display_string()
+            };
+            ui.label(RichText::new(format!("Current: [{quick_capture_str}]")).strong().color(Color32::from_rgb(0, 220, 255)));
+        });
+
         ui.add_space(10.0);
 
         if ui.add_sized([ui.available_width(), 32.0], Button::new(RichText::new("💾 Save & Apply Hotkey Changes").strong())).clicked() {
@@ -1322,7 +1525,9 @@ impl ShotgunApp {
             return;
         }
 
-        for item in &self.history {
+        let mut remove_index: Option<usize> = None;
+
+        for (index, item) in self.history.iter().enumerate() {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.strong(format!("#{:0width$}", item.counter, width = self.config.padding_digits));
@@ -1347,9 +1552,16 @@ impl ShotgunApp {
                             self.status_message = "Image copied to clipboard!".to_string();
                         }
                     }
+                    if ui.button(RichText::new("🗑️ Remove").color(Color32::from_rgb(255, 120, 120))).on_hover_text("Remove from this list only — the saved file is kept.").clicked() {
+                        remove_index = Some(index);
+                    }
                 });
             });
             ui.add_space(2.0);
+        }
+
+        if let Some(index) = remove_index {
+            self.history.remove(index);
         }
     }
 

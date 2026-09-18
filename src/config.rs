@@ -137,6 +137,12 @@ pub struct AppConfig {
     pub video_stop_hotkey: HotkeyConfig,
     #[serde(default = "default_toggle_window_hotkey")]
     pub toggle_window_hotkey: HotkeyConfig,
+    /// Snip-and-capture-immediately: opens the drag-select overlay on
+    /// whichever monitor the mouse cursor is currently on (rather than the
+    /// configured Target Monitor), then captures the picked region as soon
+    /// as it's confirmed — no separate Capture press needed afterward.
+    #[serde(default = "default_quick_capture_hotkey")]
+    pub quick_capture_hotkey: HotkeyConfig,
     #[serde(default = "default_video_fps")]
     pub video_fps: u32,
     /// Path to the ffmpeg executable. Empty string = auto-detect (next to the
@@ -215,6 +221,7 @@ impl Default for AppConfig {
                 key_name: "F12".to_string(),
             },
             toggle_window_hotkey: default_toggle_window_hotkey(),
+            quick_capture_hotkey: default_quick_capture_hotkey(),
             video_fps: 30,
             ffmpeg_path: String::new(),
             cleanup_video_frames_after_encode: false,
@@ -258,6 +265,17 @@ fn default_toggle_window_hotkey() -> HotkeyConfig {
         win: false,
         vk_code: 0x2D, // Insert
         key_name: "Insert".to_string(),
+    }
+}
+
+fn default_quick_capture_hotkey() -> HotkeyConfig {
+    HotkeyConfig {
+        ctrl: true,
+        alt: true,
+        shift: false,
+        win: false,
+        vk_code: 0x24, // Home
+        key_name: "Home".to_string(),
     }
 }
 

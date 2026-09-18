@@ -17,6 +17,7 @@ pub const HOTKEY_ID_NEW_SESSION: i32 = 1002;
 pub const HOTKEY_ID_VIDEO_START: i32 = 2001;
 pub const HOTKEY_ID_VIDEO_STOP: i32 = 2002;
 pub const HOTKEY_ID_TOGGLE_WINDOW: i32 = 3001;
+pub const HOTKEY_ID_QUICK_CAPTURE: i32 = 4001;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyAction {
@@ -25,6 +26,7 @@ pub enum HotkeyAction {
     VideoStart,
     VideoStop,
     ToggleWindow,
+    QuickCapture,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,7 @@ pub enum HotkeyEvent {
         video_start_ok: bool,
         video_stop_ok: bool,
         toggle_window_ok: bool,
+        quick_capture_ok: bool,
         error_msg: Option<String>,
     },
 }
@@ -78,6 +81,7 @@ enum HotkeyCommand {
         video_start: HotkeyConfig,
         video_stop: HotkeyConfig,
         toggle_window: HotkeyConfig,
+        quick_capture: HotkeyConfig,
     },
     Shutdown,
 }
@@ -90,6 +94,7 @@ impl HotkeyManager {
         initial_video_start: HotkeyConfig,
         initial_video_stop: HotkeyConfig,
         initial_toggle_window: HotkeyConfig,
+        initial_quick_capture: HotkeyConfig,
     ) -> (Self, Receiver<HotkeyEvent>) {
         let (event_tx, event_rx) = unbounded();
         let (cmd_tx, cmd_rx) = unbounded();
@@ -104,6 +109,7 @@ impl HotkeyManager {
                 let mut vid_start_cfg = initial_video_start;
                 let mut vid_stop_cfg = initial_video_stop;
                 let mut toggle_cfg = initial_toggle_window;
+                let mut quick_capture_cfg = initial_quick_capture;
 
                 let register_keys = |
                     cap: &HotkeyConfig,
@@ -111,6 +117,7 @@ impl HotkeyManager {
                     v_start: &HotkeyConfig,
                     v_stop: &HotkeyConfig,
                     toggle: &HotkeyConfig,
+                    quick_capture: &HotkeyConfig,
                     tx: &Sender<HotkeyEvent>,
                 | {
                     unsafe {
@@ -119,6 +126,7 @@ impl HotkeyManager {
                         UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_VIDEO_START);
                         UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_VIDEO_STOP);
                         UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_TOGGLE_WINDOW);
+                        UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_QUICK_CAPTURE);
                     }
 
                     let cap_ok = unsafe {
@@ -161,15 +169,24 @@ impl HotkeyManager {
                             toggle.vk_code,
                         ) != 0
                     };
+                    let quick_capture_ok = unsafe {
+                        RegisterHotKey(
+                            std::ptr::null_mut(),
+                            HOTKEY_ID_QUICK_CAPTURE,
+                            quick_capture.win32_modifiers(),
+                            quick_capture.vk_code,
+                        ) != 0
+                    };
 
                     let mut error_msg = None;
-                    if !(cap_ok && sess_ok && v_start_ok && v_stop_ok && toggle_ok) {
+                    if !(cap_ok && sess_ok && v_start_ok && v_stop_ok && toggle_ok && quick_capture_ok) {
                         let mut msgs = Vec::new();
                         if !cap_ok { msgs.push(format!("Failed to bind Capture ({})", cap.display_string())); }
                         if !sess_ok { msgs.push(format!("Failed to bind New Session ({})", sess.display_string())); }
                         if !v_start_ok { msgs.push(format!("Failed to bind Video Start ({})", v_start.display_string())); }
                         if !v_stop_ok { msgs.push(format!("Failed to bind Video Stop ({})", v_stop.display_string())); }
                         if !toggle_ok { msgs.push(format!("Failed to bind Show/Hide Window ({})", toggle.display_string())); }
+                        if !quick_capture_ok { msgs.push(format!("Failed to bind Quick Region Capture ({})", quick_capture.display_string())); }
                         error_msg = Some(msgs.join(" "));
                     }
 
@@ -179,24 +196,26 @@ impl HotkeyManager {
                         video_start_ok: v_start_ok,
                         video_stop_ok: v_stop_ok,
                         toggle_window_ok: toggle_ok,
+                        quick_capture_ok,
                         error_msg,
                     });
                 };
 
                 // Initial registration
-                register_keys(&cap_cfg, &sess_cfg, &vid_start_cfg, &vid_stop_cfg, &toggle_cfg, &event_tx);
+                register_keys(&cap_cfg, &sess_cfg, &vid_start_cfg, &vid_stop_cfg, &toggle_cfg, &quick_capture_cfg, &event_tx);
 
                 while running_clone.load(Ordering::Relaxed) {
                     // Process commands from UI
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
-                            HotkeyCommand::Update { capture, new_session, video_start, video_stop, toggle_window } => {
+                            HotkeyCommand::Update { capture, new_session, video_start, video_stop, toggle_window, quick_capture } => {
                                 cap_cfg = capture;
                                 sess_cfg = new_session;
                                 vid_start_cfg = video_start;
                                 vid_stop_cfg = video_stop;
                                 toggle_cfg = toggle_window;
-                                register_keys(&cap_cfg, &sess_cfg, &vid_start_cfg, &vid_stop_cfg, &toggle_cfg, &event_tx);
+                                quick_capture_cfg = quick_capture;
+                                register_keys(&cap_cfg, &sess_cfg, &vid_start_cfg, &vid_stop_cfg, &toggle_cfg, &quick_capture_cfg, &event_tx);
                             }
                             HotkeyCommand::Shutdown => {
                                 unsafe {
@@ -205,6 +224,7 @@ impl HotkeyManager {
                                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_VIDEO_START);
                                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_VIDEO_STOP);
                                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_TOGGLE_WINDOW);
+                                    UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_QUICK_CAPTURE);
                                 }
                                 return;
                             }
@@ -225,6 +245,7 @@ impl HotkeyManager {
                                     HOTKEY_ID_VIDEO_START => HotkeyAction::VideoStart,
                                     HOTKEY_ID_VIDEO_STOP => HotkeyAction::VideoStop,
                                     HOTKEY_ID_TOGGLE_WINDOW => HotkeyAction::ToggleWindow,
+                                    HOTKEY_ID_QUICK_CAPTURE => HotkeyAction::QuickCapture,
                                     _ => continue,
                                 };
                                 let _ = event_tx.send(HotkeyEvent::Triggered(action));
@@ -243,6 +264,7 @@ impl HotkeyManager {
                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_VIDEO_START);
                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_VIDEO_STOP);
                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_TOGGLE_WINDOW);
+                    UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_QUICK_CAPTURE);
                 }
             })
             .expect("Failed to spawn hotkey thread");
@@ -258,6 +280,7 @@ impl HotkeyManager {
         video_start: HotkeyConfig,
         video_stop: HotkeyConfig,
         toggle_window: HotkeyConfig,
+        quick_capture: HotkeyConfig,
     ) {
         let _ = self.cmd_tx.send(HotkeyCommand::Update {
             capture,
@@ -265,6 +288,7 @@ impl HotkeyManager {
             video_start,
             video_stop,
             toggle_window,
+            quick_capture,
         });
     }
 
