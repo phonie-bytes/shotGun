@@ -159,9 +159,24 @@ pub fn save_image_with_format(
 pub fn execute_capture(config: &mut AppConfig) -> Result<CaptureResult, String> {
     // 1. Capture screen
     let (raw_img, monitor_name) = capture_monitor_raw(config.monitor_index)?;
-    
+
     // 2. Crop to selected region
     let final_img = capture_region(&raw_img, config.region);
+
+    save_captured_image(config, &final_img, monitor_name)
+}
+
+/// Writes an already-captured (and possibly already-annotated) image to
+/// disk using the session's naming/counter/subfolder logic, and updates
+/// `config`'s counter — the same bookkeeping `execute_capture` does, minus
+/// the actual screen capture step. Used directly by the post-capture
+/// annotate flow, which already has real pixels in hand (baked from the
+/// overlay's own frozen frame) and shouldn't re-capture the screen.
+pub fn save_captured_image(
+    config: &mut AppConfig,
+    final_img: &RgbaImage,
+    monitor_name: String,
+) -> Result<CaptureResult, String> {
     let (width, height) = final_img.dimensions();
 
     // 3. Prepare target directory
@@ -197,7 +212,7 @@ pub fn execute_capture(config: &mut AppConfig) -> Result<CaptureResult, String> 
     };
 
     // 5. Save the image
-    save_image_with_format(&final_img, config.format, config.jpeg_quality, &file_path)?;
+    save_image_with_format(final_img, config.format, config.jpeg_quality, &file_path)?;
 
     let file_size_bytes = std::fs::metadata(&file_path)
         .map(|m| m.len())
