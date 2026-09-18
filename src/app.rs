@@ -40,6 +40,14 @@ pub struct ShotgunApp {
     pub history: Vec<CaptureResult>,
     pub status_message: String,
     pub overlay: RegionSelectorOverlay,
+    /// Window (outer position, inner size) saved while the app window is
+    /// temporarily borderless-fullscreened over a monitor for drag-select,
+    /// so it can be restored once the overlay closes.
+    pub overlay_saved_window: Option<(egui::Pos2, egui::Vec2)>,
+    /// Set for exactly one frame after `Decorations(false)` is sent for the
+    /// drag-select overlay, so the move/resize/overlay-start can happen on
+    /// the frame after decorations actually take effect.
+    pub pending_fullscreen_overlay: Option<usize>,
     pub tray_handler: Option<TrayHandler>,
     pub window_visible: bool,
     pub autostart_state: bool,
@@ -131,6 +139,8 @@ impl ShotgunApp {
             history: Vec::new(),
             status_message: String::new(),
             overlay: RegionSelectorOverlay::new(),
+            overlay_saved_window: None,
+            pending_fullscreen_overlay: None,
             tray_handler,
             window_visible: true,
             autostart_state,
@@ -155,7 +165,7 @@ impl ShotgunApp {
     pub fn do_capture(&mut self) {
         match execute_capture(&mut self.config) {
             Ok(result) => {
-                let msg = format!(
+                let mut msg = format!(
                     "📸 Captured #{:0width$} ({}x{}) -> {}",
                     result.counter,
                     result.width,
@@ -163,6 +173,12 @@ impl ShotgunApp {
                     result.file_path.file_name().unwrap_or_default().to_string_lossy(),
                     width = self.config.padding_digits
                 );
+                if self.config.auto_copy_to_clipboard {
+                    match Self::copy_image_to_clipboard(&result.file_path) {
+                        Ok(()) => msg.push_str(" (copied to clipboard)"),
+                        Err(e) => msg.push_str(&format!(" (clipboard copy failed: {e})")),
+                    }
+                }
                 self.status_message = msg;
                 self.history.insert(0, result);
                 if self.history.len() > 100 {
@@ -226,6 +242,7 @@ impl ShotgunApp {
             // Restore window if minimized and open prompt modal
             self.window_visible = true;
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
 
             self.temp_session_path = self.config.output_dir.clone();
@@ -339,9 +356,89 @@ impl ShotgunApp {
         }
     }
 
+    /// Kicks off expanding the app's own window into a borderless overlay
+    /// covering the *actual* target monitor at (close to) 1:1 scale, then
+    /// starting the freeze-frame drag-select. Without this, dragging happens
+    /// inside whatever small size the app window currently is, which makes
+    /// precise region selection awkward — this makes it behave like a real
+    /// full-screen snipping tool instead.
+    ///
+    /// This only sends `Decorations(false)` here and defers the actual
+    /// move/resize/overlay-start to the *next* frame (see
+    /// `pending_fullscreen_overlay` handling in `update()`). Windows/winit
+    /// can recreate the native window when decorations are toggled, and a
+    /// position/size command sent in the same batch as that toggle is prone
+    /// to being silently dropped mid-recreation.
+    fn start_drag_select_overlay(&mut self, ctx: &Context) {
+        if self.monitors.get(self.config.monitor_index).is_none() {
+            self.status_message = "No monitor available to select on.".to_string();
+            return;
+        }
+
+        if self.overlay_saved_window.is_none() {
+            // Save outer position (so the window reappears where it was)
+            // but *inner* size: restoring re-enables decorations, and
+            // InnerSize is content size excluding chrome. Using outer size
+            // there would add the title-bar/border thickness on top of
+            // itself every time this overlay is used, growing the window.
+            let outer_pos = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+            let inner_size = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
+            if let (Some(pos), Some(size)) = (outer_pos, inner_size) {
+                self.overlay_saved_window = Some((pos, size));
+            }
+        }
+
+        ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
+        self.pending_fullscreen_overlay = Some(self.config.monitor_index);
+    }
+
+    /// Second half of `start_drag_select_overlay`, run on the frame after
+    /// decorations were dropped: move/resize the (now borderless) window
+    /// over the target monitor and start the freeze-frame capture.
+    fn apply_pending_fullscreen_overlay(&mut self, ctx: &Context) {
+        let Some(monitor_index) = self.pending_fullscreen_overlay.take() else {
+            return;
+        };
+        let Some(mon) = self.monitors.get(monitor_index).cloned() else {
+            self.restore_window_after_overlay(ctx);
+            return;
+        };
+
+        let scale = mon.scale_factor.max(0.01);
+        let pos = egui::Pos2::new(mon.x as f32 / scale, mon.y as f32 / scale);
+        let size = egui::Vec2::new(mon.width as f32 / scale, mon.height as f32 / scale);
+
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+
+        if let Err(e) = self.overlay.start(ctx, monitor_index) {
+            self.status_message = format!("Overlay error: {e}");
+            self.restore_window_after_overlay(ctx);
+        }
+    }
+
+    /// Restores the app window's normal size/position/decorations after a
+    /// drag-select overlay (started by `start_drag_select_overlay`) closes.
+    fn restore_window_after_overlay(&mut self, ctx: &Context) {
+        if let Some((pos, size)) = self.overlay_saved_window.take() {
+            ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+    }
+
     pub fn toggle_window_visibility(&mut self, ctx: &Context) {
         self.window_visible = !self.window_visible;
-        ctx.send_viewport_cmd(ViewportCommand::Visible(self.window_visible));
+        // Deliberately never send Visible(false): on Windows, a genuinely
+        // hidden (WS_VISIBLE=false) window stops receiving RedrawRequested
+        // entirely, which stops egui's update() loop from ever running
+        // again — bricking the app so no hotkey, tray click, or menu action
+        // can be processed, including the one meant to show it again.
+        // Minimized windows don't have this problem (eframe still pumps
+        // them), so "hide" is implemented as minimize instead.
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(!self.window_visible));
         if self.window_visible {
             ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
@@ -480,7 +577,11 @@ impl eframe::App for ShotgunApp {
             }
         }
 
-        // 3. Render Full-Screen Snipping Overlay if Active
+        // 3. Complete any drag-select overlay whose window decorations were
+        //    just dropped last frame, now that the resize can actually stick.
+        self.apply_pending_fullscreen_overlay(ctx);
+
+        // 4. Render Full-Screen Snipping Overlay if Active
         match self.overlay.show(ctx) {
             OverlayAction::Confirmed(region) => {
                 self.config.region = Some(region);
@@ -489,9 +590,11 @@ impl eframe::App for ShotgunApp {
                     "🎯 Region selected: X={}, Y={}, {}x{} px",
                     region.x, region.y, region.width, region.height
                 );
+                self.restore_window_after_overlay(ctx);
             }
             OverlayAction::Cancelled => {
                 self.status_message = "Selection cancelled.".to_string();
+                self.restore_window_after_overlay(ctx);
             }
             OverlayAction::None => {}
         }
@@ -500,7 +603,7 @@ impl eframe::App for ShotgunApp {
             return;
         }
 
-        // 4. Top Header & Nav Bar (Compact & Sleek)
+        // 5. Top Header & Nav Bar (Compact & Sleek)
         TopBottomPanel::top("top_header").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -550,7 +653,7 @@ impl eframe::App for ShotgunApp {
             ui.add_space(2.0);
         });
 
-        // 5. Bottom Status Bar
+        // 6. Bottom Status Bar
         TopBottomPanel::bottom("bottom_status").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
@@ -571,7 +674,7 @@ impl eframe::App for ShotgunApp {
             ui.add_space(2.0);
         });
 
-        // 6. Central Content Panel
+        // 7. Central Content Panel
         CentralPanel::default().show(ctx, |ui| {
             ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 match self.active_tab {
@@ -585,7 +688,7 @@ impl eframe::App for ShotgunApp {
             });
         });
 
-        // 7. Interactive Session Reset Modal
+        // 8. Interactive Session Reset Modal
         if self.session_modal_open {
             egui::Window::new("🔄 Configure New Session")
                 .collapsible(false)
@@ -714,9 +817,7 @@ impl ShotgunApp {
                 [ui.available_width(), 32.0],
                 Button::new(RichText::new("🎯 Drag-Select ROI on Screen (Snipping Overlay)").size(13.5).strong().color(Color32::from_rgb(0, 220, 255)))
             ).on_hover_text("Freezes screen to draw a precise ROI rectangle").clicked() {
-                if let Err(e) = self.overlay.start(ctx, self.config.monitor_index) {
-                    self.status_message = format!("Overlay error: {e}");
-                }
+                self.start_drag_select_overlay(ctx);
             }
 
             ui.add_space(6.0);
@@ -1117,6 +1218,10 @@ impl ShotgunApp {
             }
 
             if ui.checkbox(&mut self.config.play_sound, "Play audio chime on capture").changed() {
+                let _ = self.config.save();
+            }
+
+            if ui.checkbox(&mut self.config.auto_copy_to_clipboard, "Automatically copy each screenshot to clipboard on capture").changed() {
                 let _ = self.config.save();
             }
         });

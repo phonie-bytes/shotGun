@@ -23,6 +23,13 @@
 
 ---
 
+## ✅ Recently Fixed
+- [x] **Drag-select ROI now covers the real physical monitor, not just the small app window**: "🎯 Drag-Select ROI on Screen" used to draw the freeze-frame overlay inside whatever size the app window happened to be, making precise selection awkward on a small window. It now temporarily borderless-fullscreens the app window over the actual target monitor (1:1 physical pixel scale) before starting the drag-select, and restores the window's original position/size/decorations afterward. See BUGS.md #9.
+- [x] **"Copy to clipboard" opt-in on capture**: added a Settings checkbox ("Automatically copy each screenshot to clipboard on capture", off by default) so every capture can optionally also go straight to the clipboard, in addition to the existing per-item 📋 Copy button in History.
+- [x] **Window disappearing + app going fully unresponsive to tray/hotkeys**: `toggle_window_visibility` used `ViewportCommand::Visible(false)` to hide the window, which stops Windows from ever delivering `RedrawRequested` again — starving egui's `update()` loop, which is what drains the hotkey/tray/capture channels. The first hide permanently bricked all of those. Fixed by hiding via `Minimized(true)`/`Minimized(false)` only, never `Visible(false)`. See BUGS.md #8.
+
+---
+
 ## 🔧 Outstanding / Near-term
 - [ ] **Progress bar / spinner for MP4 & PDF creation**: currently "Stopping & encoding video..." / PDF export are only reflected as status-bar text with no visual busy indicator — add a spinner or progress bar so it's clear the app is working, not frozen, especially since encoding still blocks the UI thread until ffmpeg finishes.
 - [ ] **Async ffmpeg mux**: the final ffmpeg encode step still runs synchronously on `stop_video()`, blocking the UI momentarily for longer recordings — move it off the UI-blocking path (ties in with the progress indicator above).

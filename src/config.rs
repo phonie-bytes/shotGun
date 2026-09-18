@@ -152,6 +152,11 @@ pub struct AppConfig {
     /// the individual image files).
     #[serde(default)]
     pub auto_export_pdf_on_session: bool,
+    /// Automatically copy every screenshot to the clipboard right after it's
+    /// captured (in addition to saving the file). Off by default since it's
+    /// not always wanted.
+    #[serde(default)]
+    pub auto_copy_to_clipboard: bool,
 }
 
 impl Default for AppConfig {
@@ -214,6 +219,7 @@ impl Default for AppConfig {
             ffmpeg_path: String::new(),
             cleanup_video_frames_after_encode: false,
             auto_export_pdf_on_session: false,
+            auto_copy_to_clipboard: false,
         }
     }
 }
