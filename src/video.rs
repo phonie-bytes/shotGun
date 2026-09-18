@@ -276,16 +276,18 @@ pub enum VideoResult {
 /// Handle returned from `start_video_capture`. Used to stop the capture.
 pub struct VideoHandle {
     stop_flag: Arc<AtomicBool>,
-    thread_handle: thread::JoinHandle<()>,
 }
 
 impl VideoHandle {
-    /// Stop the video capture and wait for the worker thread (and the
-    /// ffmpeg encode step) to finish. The result is delivered on the
-    /// `Receiver<VideoResult>` returned alongside this handle.
+    /// Signal the capture thread to stop. Returns immediately — the actual
+    /// stop-and-encode work (including the potentially slow ffmpeg mux)
+    /// keeps running on the worker thread, which sends its outcome
+    /// asynchronously on the `Receiver<VideoResult>` returned alongside
+    /// this handle. Callers should poll that receiver (e.g. `try_recv()`
+    /// each frame) rather than blocking on it; blocking here used to freeze
+    /// the whole UI for the entire encode step.
     pub fn stop(self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        let _ = self.thread_handle.join();
     }
 }
 
@@ -371,13 +373,17 @@ fn write_concat_file(output_dir: &Path, filename_prefix: &str, times: &[Instant]
 
 /// Starts a video capture session in a background thread. Returns a handle
 /// used to stop the capture, and a receiver that yields the encode result
-/// once `stop()` completes.
+/// asynchronously once the worker thread (started here) finishes the
+/// stop-and-encode work after `stop()` is called.
 pub fn start_video_capture(cfg: VideoConfig) -> (VideoHandle, Receiver<VideoResult>) {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = stop_flag.clone();
     let (result_tx, result_rx): (Sender<VideoResult>, Receiver<VideoResult>) = unbounded();
 
-    let thread_handle = thread::spawn(move || {
+    // Not bound to a variable: this thread runs detached. Its outcome is
+    // communicated entirely through `result_tx`/`result_rx`, so there's
+    // nothing to join.
+    thread::spawn(move || {
         debug_log(&format!(
             "=== start_video_capture: output_dir={} monitor_index={} fps={} region={:?} ===",
             cfg.output_dir.display(), cfg.monitor_index, cfg.fps, cfg.region
@@ -635,13 +641,7 @@ pub fn start_video_capture(cfg: VideoConfig) -> (VideoHandle, Receiver<VideoResu
         }
     });
 
-    (
-        VideoHandle {
-            stop_flag,
-            thread_handle,
-        },
-        result_rx,
-    )
+    (VideoHandle { stop_flag }, result_rx)
 }
 
 /// Convenience wrapper used by the UI to start a capture with the global config.

@@ -206,6 +206,59 @@ impl RegionSelectorOverlay {
                     }
                 }
 
+                // 3b. Magnifier loupe near the cursor while dragging, for
+                // pixel-precise edge alignment: an 8x zoomed sample of the
+                // frozen screenshot around the cursor, with a crosshair
+                // marking the exact pixel that would be used as the edge.
+                if self.is_dragging {
+                    if let (Some(cursor), Some(tex)) = (self.current_pos, &self.texture) {
+                        const LOUPE_SIZE: f32 = 120.0;
+                        const ZOOM: f32 = 8.0;
+                        let sample_size_pts = LOUPE_SIZE / ZOOM;
+
+                        // Offset from the cursor so the loupe doesn't cover
+                        // the exact point being aligned; flip to whichever
+                        // side keeps it fully on-screen near an edge.
+                        let mut loupe_pos = cursor + Vec2::new(24.0, 24.0);
+                        if loupe_pos.x + LOUPE_SIZE > screen_rect.max.x {
+                            loupe_pos.x = cursor.x - 24.0 - LOUPE_SIZE;
+                        }
+                        if loupe_pos.y + LOUPE_SIZE > screen_rect.max.y {
+                            loupe_pos.y = cursor.y - 24.0 - LOUPE_SIZE;
+                        }
+                        let loupe_rect = Rect::from_min_size(loupe_pos, Vec2::splat(LOUPE_SIZE));
+
+                        let uv_center = Pos2::new(
+                            (cursor.x - screen_rect.min.x) / screen_rect.width(),
+                            (cursor.y - screen_rect.min.y) / screen_rect.height(),
+                        );
+                        let half_uv = Vec2::new(
+                            (sample_size_pts / 2.0) / screen_rect.width(),
+                            (sample_size_pts / 2.0) / screen_rect.height(),
+                        );
+                        let uv_rect = Rect::from_min_max(uv_center - half_uv, uv_center + half_uv);
+
+                        painter.rect_filled(loupe_rect.expand(2.0), 4.0, Color32::BLACK);
+                        painter.image(tex.id(), loupe_rect, uv_rect, Color32::WHITE);
+                        painter.rect_stroke(
+                            loupe_rect,
+                            4.0,
+                            Stroke::new(2.0, Color32::from_rgb(0, 220, 255)),
+                        );
+
+                        let center = loupe_rect.center();
+                        let crosshair = Stroke::new(1.0, Color32::from_rgb(255, 60, 60));
+                        painter.line_segment(
+                            [Pos2::new(center.x - 8.0, center.y), Pos2::new(center.x + 8.0, center.y)],
+                            crosshair,
+                        );
+                        painter.line_segment(
+                            [Pos2::new(center.x, center.y - 8.0), Pos2::new(center.x, center.y + 8.0)],
+                            crosshair,
+                        );
+                    }
+                }
+
                 // 4. Instructions banner at the top
                 let banner_rect = Rect::from_center_size(
                     Pos2::new(screen_rect.center().x, screen_rect.min.y + 40.0),

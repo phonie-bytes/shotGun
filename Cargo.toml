@@ -39,6 +39,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
 ] }
 printpdf = { version = "0.12", features = ["images", "png", "jpeg"] }
+raw-window-handle = "0.6"
 
 
 

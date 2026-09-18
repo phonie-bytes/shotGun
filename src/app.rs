@@ -18,8 +18,13 @@ use egui::{
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::POINT;
-use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
+    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_TOOLWINDOW,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
@@ -65,6 +70,10 @@ pub struct ShotgunApp {
     pub pending_quick_capture: bool,
     pub tray_handler: Option<TrayHandler>,
     pub window_visible: bool,
+    /// Tracks the OS-reported minimized state from the previous frame, so
+    /// `maybe_toggle_taskbar_for_minimize` can act only on the transition
+    /// (just-minimized / just-restored) rather than every frame.
+    pub was_minimized: bool,
     pub autostart_state: bool,
 
     // Hotkey temp state
@@ -80,6 +89,15 @@ pub struct ShotgunApp {
     // Video capture handle
     pub video_handle: Option<video::VideoHandle>,
     pub video_result_rx: Option<Receiver<video::VideoResult>>,
+    /// True while waiting on the async encode result after `stop_video()`,
+    /// used to show a "stopping & encoding" spinner in the status bar.
+    pub video_encoding: bool,
+    /// When the current recording started, for the live "REC 00:01:23"
+    /// timer shown next to the Stop Video button.
+    pub recording_started_at: Option<std::time::Instant>,
+    /// Async PDF export in flight, if any: (label to prefix the status
+    /// message with once done, receiver for the result).
+    pub pdf_export_rx: Option<(String, Receiver<Result<PathBuf, String>>)>,
 
     // Interactive Session Reset Modal State
     pub session_modal_open: bool,
@@ -168,6 +186,7 @@ impl ShotgunApp {
             pending_quick_capture: false,
             tray_handler,
             window_visible: true,
+            was_minimized: false,
             autostart_state,
             // hotkey UI indices
             temp_capture_key_idx,
@@ -178,6 +197,9 @@ impl ShotgunApp {
             temp_quick_capture_key_idx,
             video_handle: None,
             video_result_rx: None,
+            video_encoding: false,
+            recording_started_at: None,
+            pdf_export_rx: None,
             // session modal state
             session_modal_open: false,
             temp_session_name,
@@ -222,44 +244,69 @@ impl ShotgunApp {
             self.status_message = "⏺️ Video recording already in progress.".to_string();
             return;
         }
+        if self.video_encoding {
+            // Starting now would replace `video_result_rx` and silently
+            // drop the previous recording's still-in-flight encode result.
+            self.status_message = "⏳ Still encoding the previous recording — wait for that to finish first.".to_string();
+            return;
+        }
         crate::video::debug_log("app.rs: start_video() called");
         let (handle, result_rx) = video::start_from_global(&self.config);
         self.video_handle = Some(handle);
         self.video_result_rx = Some(result_rx);
+        self.recording_started_at = Some(std::time::Instant::now());
         self.status_message = "⏺️ Video recording started.".to_string();
     }
 
+    /// Signals the recording to stop and returns immediately — the actual
+    /// encode outcome is picked up asynchronously by `poll_video_result`,
+    /// called every frame from `update()`, so the UI never blocks (and
+    /// keeps painting the "stopping & encoding" spinner) while ffmpeg runs.
     pub fn stop_video(&mut self) {
         match self.video_handle.take() {
             Some(handle) => {
                 crate::video::debug_log("app.rs: stop_video() called, stopping handle");
                 self.status_message = "⏳ Stopping & encoding video...".to_string();
+                self.video_encoding = true;
+                self.recording_started_at = None;
                 handle.stop();
-                if let Some(rx) = self.video_result_rx.take() {
-                    match rx.recv() {
-                        Ok(result) => {
-                            self.status_message = match result {
-                                video::VideoResult::Encoded { path, frame_count, has_audio } => format!(
-                                    "🎬 Video saved: {} ({frame_count} frames{})",
-                                    path.file_name().unwrap_or_default().to_string_lossy(),
-                                    if has_audio { ", with audio" } else { ", no audio captured" }
-                                ),
-                                video::VideoResult::EncodeFailed { frames_dir, frame_count, reason } => format!(
-                                    "⚠️ Recorded {frame_count} frames but couldn't encode MP4 ({reason}). Frames saved in {}",
-                                    frames_dir.display()
-                                ),
-                            };
-                        }
-                        Err(_) => {
-                            crate::video::debug_log("app.rs: result channel disconnected without a result (video thread likely panicked)");
-                            self.status_message = "❌ Video capture failed unexpectedly (no result). Check shotgun_video_debug.log in %TEMP%.".to_string();
-                        }
-                    }
-                }
             }
             None => {
                 self.status_message = "No video recording in progress.".to_string();
             }
+        }
+    }
+
+    /// Polls the video encode result channel without blocking. Called every
+    /// frame; a no-op unless `stop_video()` was called and the worker
+    /// thread's ffmpeg step has since finished.
+    fn poll_video_result(&mut self) {
+        let Some(rx) = &self.video_result_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.status_message = match result {
+                    video::VideoResult::Encoded { path, frame_count, has_audio } => format!(
+                        "🎬 Video saved: {} ({frame_count} frames{})",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        if has_audio { ", with audio" } else { ", no audio captured" }
+                    ),
+                    video::VideoResult::EncodeFailed { frames_dir, frame_count, reason } => format!(
+                        "⚠️ Recorded {frame_count} frames but couldn't encode MP4 ({reason}). Frames saved in {}",
+                        frames_dir.display()
+                    ),
+                };
+                self.video_encoding = false;
+                self.video_result_rx = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                crate::video::debug_log("app.rs: result channel disconnected without a result (video thread likely panicked)");
+                self.status_message = "❌ Video capture failed unexpectedly (no result). Check shotgun_video_debug.log in %TEMP%.".to_string();
+                self.video_encoding = false;
+                self.video_result_rx = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
     }
 
@@ -334,19 +381,8 @@ impl ShotgunApp {
             return;
         };
         let dest_path = dest_dir.join(format!("{}{:02}_screenshots.pdf", self.config.session_prefix, ending_session));
-        match pdf_export::export_images_to_pdf(&items, &dest_path) {
-            Ok(()) => {
-                self.status_message = format!(
-                    "{} 📄 Also exported {} screenshots to {}",
-                    self.status_message,
-                    items.len(),
-                    dest_path.file_name().unwrap_or_default().to_string_lossy()
-                );
-            }
-            Err(e) => {
-                self.status_message = format!("{} ⚠️ PDF export failed: {e}", self.status_message);
-            }
-        }
+        let label = format!("{} 📄 Also exported {} screenshots to ", self.status_message, items.len());
+        self.spawn_pdf_export(items, dest_path, label);
     }
 
     /// Exports everything currently in the History tab to a single PDF
@@ -355,6 +391,10 @@ impl ShotgunApp {
     pub fn export_history_to_pdf(&mut self) {
         if self.history.is_empty() {
             self.status_message = "No screenshots in history to export.".to_string();
+            return;
+        }
+        if self.pdf_export_rx.is_some() {
+            self.status_message = "A PDF export is already in progress.".to_string();
             return;
         }
         let items: Vec<CaptureResult> = self.history.iter().rev().cloned().collect();
@@ -368,17 +408,48 @@ impl ShotgunApp {
             return; // user cancelled
         };
 
-        match pdf_export::export_images_to_pdf(&items, &dest_path) {
-            Ok(()) => {
-                self.status_message = format!(
-                    "📄 Exported {} screenshots to {}",
-                    items.len(),
-                    dest_path.file_name().unwrap_or_default().to_string_lossy()
-                );
+        let label = format!("📄 Exported {} screenshots to ", items.len());
+        self.status_message = "⏳ Exporting to PDF...".to_string();
+        self.spawn_pdf_export(items, dest_path, label);
+    }
+
+    /// Runs `pdf_export::export_images_to_pdf` on a background thread so
+    /// the UI stays responsive for large histories, and stores the
+    /// receiver for `poll_pdf_export_result` (called every frame) to pick
+    /// up. `label` is prefixed onto the eventual "exported to <filename>"
+    /// status message — building it now lets callers capture whatever
+    /// status text already existed (e.g. the New Session message) before
+    /// this overwrites it with the in-progress spinner text.
+    fn spawn_pdf_export(&mut self, items: Vec<CaptureResult>, dest_path: PathBuf, label: String) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        thread::spawn(move || {
+            let result = pdf_export::export_images_to_pdf(&items, &dest_path).map(|()| dest_path);
+            let _ = tx.send(result);
+        });
+        self.pdf_export_rx = Some((label, rx));
+    }
+
+    /// Polls the PDF export result channel without blocking. Called every
+    /// frame; a no-op unless `spawn_pdf_export` started one and it hasn't
+    /// finished yet.
+    fn poll_pdf_export_result(&mut self) {
+        let Some((label, rx)) = &self.pdf_export_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(dest_path)) => {
+                self.status_message = format!("{label}{}", dest_path.file_name().unwrap_or_default().to_string_lossy());
+                self.pdf_export_rx = None;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 self.status_message = format!("⚠️ PDF export failed: {e}");
+                self.pdf_export_rx = None;
             }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.status_message = "⚠️ PDF export failed unexpectedly.".to_string();
+                self.pdf_export_rx = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
     }
 
@@ -601,6 +672,68 @@ impl ShotgunApp {
         }
     }
 
+    /// Implements "Keep running in System Tray when minimized": when the
+    /// window transitions to minimized (by any means — the native minimize
+    /// button, Win+M, etc.) and the setting is on, also hides its taskbar
+    /// button by adding the `WS_EX_TOOLWINDOW` extended style, so it
+    /// disappears from the taskbar entirely and is only reachable via the
+    /// tray icon. On the reverse transition (restored), the style is always
+    /// removed again regardless of the current setting value, so a window
+    /// that comes back is never left stranded without a taskbar entry.
+    ///
+    /// Deliberately does *not* use `ViewportCommand::Visible` for any of
+    /// this — seeing BUGS.md #8, that stops the window from ever receiving
+    /// `RedrawRequested` again, bricking the app. `WS_EX_TOOLWINDOW` only
+    /// affects taskbar/alt-tab presentation, not `WS_VISIBLE`, so it doesn't
+    /// have that problem: the window keeps painting and processing input
+    /// exactly as a normal minimized window would.
+    fn maybe_toggle_taskbar_for_minimize(&mut self, ctx: &Context, frame: &eframe::Frame) {
+        let is_minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        if is_minimized == self.was_minimized {
+            return;
+        }
+        self.was_minimized = is_minimized;
+
+        if is_minimized {
+            if self.config.minimize_to_tray {
+                Self::set_taskbar_button_visible(frame, false);
+            }
+        } else {
+            Self::set_taskbar_button_visible(frame, true);
+        }
+    }
+
+    /// Adds or removes `WS_EX_TOOLWINDOW` on the app's native window,
+    /// which controls whether it has a taskbar button. Silently does
+    /// nothing if the raw window handle isn't available (e.g. non-Win32
+    /// platforms) or isn't a Win32 handle.
+    fn set_taskbar_button_visible(frame: &eframe::Frame, visible: bool) {
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = win32.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+        unsafe {
+            let mut ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if visible {
+                ex_style &= !(WS_EX_TOOLWINDOW as isize);
+            } else {
+                ex_style |= WS_EX_TOOLWINDOW as isize;
+            }
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+            // WS_EX_TOOLWINDOW changes don't reliably take effect on the
+            // taskbar until the frame is explicitly refreshed.
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+    }
+
     pub fn refresh_monitors(&mut self) {
         self.monitors = get_monitors();
         if self.config.monitor_index >= self.monitors.len() {
@@ -684,8 +817,10 @@ impl ShotgunApp {
 }
 
 impl eframe::App for ShotgunApp {
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+
+        self.maybe_toggle_taskbar_for_minimize(ctx, frame);
 
         // 1. Process System Tray Events
         if let Some(tray) = &self.tray_handler {
@@ -749,6 +884,11 @@ impl eframe::App for ShotgunApp {
         self.apply_pending_fullscreen_enter(ctx);
         self.apply_pending_restore_size(ctx);
 
+        // Poll async work (video encode, PDF export) without ever blocking
+        // the UI thread on either.
+        self.poll_video_result();
+        self.poll_pdf_export_result();
+
         // 4. Render Full-Screen Snipping Overlay if Active
         match self.overlay.show(ctx) {
             OverlayAction::Confirmed(region) => {
@@ -803,6 +943,21 @@ impl eframe::App for ShotgunApp {
                         if ui.button(RichText::new("⏹ Stop Video").size(12.0).color(Color32::from_rgb(255, 100, 100)).strong()).on_hover_text(format!("Stop video recording. Hotkey: [{}]", self.config.video_stop_hotkey.display_string())).clicked() {
                             self.stop_video();
                         }
+                        if let Some(started_at) = self.recording_started_at {
+                            let elapsed = started_at.elapsed().as_secs();
+                            // Pulses by alternating the dot's brightness twice a second.
+                            let pulse_on = (ctx.input(|i| i.time) * 2.0) as u64 % 2 == 0;
+                            let dot = if pulse_on { "🔴" } else { "⭕" };
+                            ui.label(
+                                RichText::new(format!("{dot} REC {:02}:{:02}:{:02}", elapsed / 3600, (elapsed / 60) % 60, elapsed % 60))
+                                    .size(12.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 100, 100)),
+                            );
+                        }
+                    } else if self.video_encoding {
+                        ui.add_enabled(false, Button::new(RichText::new("⏺ Record Video").size(12.0)));
+                        ui.spinner();
                     } else if ui.button(RichText::new("⏺ Record Video").size(12.0).color(Color32::from_rgb(255, 180, 0)).strong()).on_hover_text(format!("Start video recording. Hotkey: [{}]", self.config.video_start_hotkey.display_string())).clicked() {
                         self.start_video();
                     }
@@ -826,6 +981,9 @@ impl eframe::App for ShotgunApp {
         TopBottomPanel::bottom("bottom_status").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
+                if self.video_encoding || self.pdf_export_rx.is_some() {
+                    ui.spinner();
+                }
                 ui.label(RichText::new(&self.status_message).size(11.5));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let mon_name = self
