@@ -37,6 +37,17 @@ pub enum ActiveTab {
     About,
 }
 
+/// One finished screen recording, remembered for the History tab so it can be
+/// opened, located, or copied (as a file) without digging through Explorer.
+#[derive(Clone)]
+pub struct VideoEntry {
+    pub path: PathBuf,
+    pub frame_count: u32,
+    pub has_audio: bool,
+    pub file_size_bytes: u64,
+    pub timestamp: String,
+}
+
 pub struct ShotgunApp {
     pub config: AppConfig,
     pub monitors: Vec<MonitorInfo>,
@@ -46,6 +57,8 @@ pub struct ShotgunApp {
     pub hotkey_error: Option<String>,
     pub active_tab: ActiveTab,
     pub history: Vec<CaptureResult>,
+    /// Recordings finished this run (newest first). In-memory like `history`.
+    pub video_history: Vec<VideoEntry>,
     pub status_message: String,
     pub overlay: RegionSelectorOverlay,
     /// Window (outer position, inner size) saved while the app window is
@@ -241,6 +254,7 @@ impl ShotgunApp {
             hotkey_error: None,
             active_tab: ActiveTab::ScreenRegion,
             history: Vec::new(),
+            video_history: Vec::new(),
             status_message: String::new(),
             overlay: RegionSelectorOverlay::new(),
             overlay_saved_window: None,
@@ -408,11 +422,24 @@ impl ShotgunApp {
         match rx.try_recv() {
             Ok(result) => {
                 self.status_message = match result {
-                    video::VideoResult::Encoded { path, frame_count, has_audio } => format!(
-                        "🎬 Video saved: {} ({frame_count} frames{})",
-                        path.file_name().unwrap_or_default().to_string_lossy(),
-                        if has_audio { ", with audio" } else { ", no audio captured" }
-                    ),
+                    video::VideoResult::Encoded { path, frame_count, has_audio } => {
+                        let msg = format!(
+                            "🎬 Video saved: {} ({frame_count} frames{})",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            if has_audio { ", with audio" } else { ", no audio captured" }
+                        );
+                        self.video_history.insert(0, VideoEntry {
+                            file_size_bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                            timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                            path,
+                            frame_count,
+                            has_audio,
+                        });
+                        if self.video_history.len() > 50 {
+                            self.video_history.pop();
+                        }
+                        msg
+                    }
                     video::VideoResult::EncodeFailed { frames_dir, frame_count, reason } => format!(
                         "⚠️ Recorded {frame_count} frames but couldn't encode MP4 ({reason}). Frames saved in {}",
                         frames_dir.display()
@@ -2390,7 +2417,7 @@ impl ShotgunApp {
     fn render_history_tab(&mut self, ui: &mut Ui) {
         ui.heading("📜 Capture History");
         ui.horizontal(|ui| {
-            ui.label(format!("Total: {}", self.history.len()));
+            ui.label(format!("Screenshots: {}", self.history.len()));
             if !self.history.is_empty() {
                 if ui.button("📄 Export to PDF").clicked() {
                     self.export_history_to_pdf();
@@ -2404,7 +2431,6 @@ impl ShotgunApp {
 
         if self.history.is_empty() {
             ui.label(RichText::new("No screenshots captured yet.").color(Color32::GRAY));
-            return;
         }
 
         let mut remove_index: Option<usize> = None;
@@ -2444,6 +2470,81 @@ impl ShotgunApp {
 
         if let Some(index) = remove_index {
             self.history.remove(index);
+        }
+
+        self.render_video_history(ui);
+    }
+
+    /// The "Recordings" half of the History tab. Copy puts the MP4 on the
+    /// clipboard *as a file* (like Ctrl+C in Explorer) — video has no
+    /// paste-the-pixels format the way images do.
+    fn render_video_history(&mut self, ui: &mut Ui) {
+        ui.add_space(10.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.heading("🎬 Recordings");
+            ui.label(format!("{}", self.video_history.len()));
+            if !self.video_history.is_empty() && ui.button("Clear").clicked() {
+                self.video_history.clear();
+            }
+        });
+        ui.add_space(4.0);
+
+        if self.video_history.is_empty() {
+            ui.label(RichText::new("No recordings this session.").color(Color32::GRAY));
+            return;
+        }
+
+        let mut remove_index: Option<usize> = None;
+        let mut copy_result: Option<Result<(), String>> = None;
+
+        for (index, item) in self.video_history.iter().enumerate() {
+            let missing = !item.path.exists();
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(item.path.file_name().unwrap_or_default().to_string_lossy()).strong());
+                    ui.label(format!("{:.1} MB, {} frames", item.file_size_bytes as f64 / (1024.0 * 1024.0), item.frame_count));
+                    ui.label(if item.has_audio { "🔊 audio" } else { "🔇 no audio" });
+                    ui.label(RichText::new(&item.timestamp).color(Color32::GRAY).size(11.0));
+                    if missing {
+                        ui.label(RichText::new("⚠ file no longer exists").color(Color32::from_rgb(255, 180, 80)));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!missing, |ui| {
+                        if ui.button("▶ Play").clicked() {
+                            Self::open_file(&item.path);
+                        }
+                        if ui.button("📂 Locate").clicked() {
+                            Self::select_in_explorer(&item.path);
+                        }
+                        if ui
+                            .button("📋 Copy")
+                            .on_hover_text("Copies the video file to the clipboard — paste it into Explorer, chat, or email.")
+                            .clicked()
+                        {
+                            copy_result = Some(crate::clipboard_files::copy_file_to_clipboard(&item.path));
+                        }
+                    });
+                    if ui
+                        .button(RichText::new("🗑️ Remove").color(Color32::from_rgb(255, 120, 120)))
+                        .on_hover_text("Remove from this list only — the saved file is kept.")
+                        .clicked()
+                    {
+                        remove_index = Some(index);
+                    }
+                });
+            });
+            ui.add_space(2.0);
+        }
+
+        match copy_result {
+            Some(Ok(())) => self.status_message = "Video file copied to clipboard — paste it where you need it.".to_string(),
+            Some(Err(e)) => self.status_message = format!("Clipboard error: {e}"),
+            None => {}
+        }
+        if let Some(index) = remove_index {
+            self.video_history.remove(index);
         }
     }
 

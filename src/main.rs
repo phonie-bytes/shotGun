@@ -5,6 +5,7 @@ mod app;
 mod audio;
 mod autostart;
 mod capture;
+mod clipboard_files;
 mod config;
 mod dxgi_capture;
 mod hotkey;
