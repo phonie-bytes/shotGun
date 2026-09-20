@@ -1790,8 +1790,17 @@ impl ShotgunApp {
             if ui.add_sized(
                 [ui.available_width(), 32.0],
                 Button::new(RichText::new("🎯 Drag-Select ROI on Screen (Snipping Overlay)").size(13.5).strong().color(Color32::from_rgb(0, 220, 255)))
-            ).on_hover_text("Freezes screen to draw a precise ROI rectangle").clicked() {
+            ).on_hover_text(if self.config.annotate_after_manual_select {
+                "Freezes screen to draw a region, then opens the annotate editor and saves the result (see Settings)"
+            } else {
+                "Freezes screen to draw a precise ROI rectangle"
+            }).clicked() {
                 self.start_drag_select_overlay(ctx);
+                // Opt-in: route this through the same annotate-then-save path
+                // Quick Region Capture uses. Cancel/Annotated both clear it.
+                if self.config.annotate_after_manual_select {
+                    self.pending_quick_capture = true;
+                }
             }
 
             ui.add_space(6.0);
@@ -2241,6 +2250,15 @@ impl ShotgunApp {
             if ui.checkbox(&mut self.config.auto_copy_to_clipboard, "Automatically copy each screenshot to clipboard on capture").changed() {
                 let _ = self.config.save();
             }
+
+            if ui.checkbox(&mut self.config.annotate_after_manual_select, "Annotate after \"Drag-Select ROI\" too (opens the editor and saves the result)").changed() {
+                let _ = self.config.save();
+            }
+            ui.label(
+                RichText::new("Quick Region Capture always annotates. This makes the Screen tab's Drag-Select button do the same, so it captures and saves instead of only remembering the region.")
+                    .size(10.5)
+                    .color(Color32::GRAY),
+            );
         });
 
         ui.add_space(8.0);

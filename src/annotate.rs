@@ -328,15 +328,14 @@ fn draw_glyph(image: &mut RgbaImage, x: f32, y: f32, ch: char, color: [u8; 4], s
 /// A compact 5x7 hand-drawn bitmap font. Each glyph is 7 rows, each row's
 /// low 5 bits giving the pixel pattern (bit 4 = leftmost column).
 ///
-/// Only one case is drawn — lowercase letters render as their uppercase
-/// glyph — trading true lower/upper distinction for a much smaller,
-/// entirely self-authored table. At the small sizes this is used for, the
-/// difference isn't legibility-critical. Deliberately hand-authored rather
-/// than sourced from an existing font file, both to avoid a licensing
-/// question and to keep this dependency-free.
+/// Both cases are drawn. Lowercase x-height letters sit on rows 2-6 with
+/// ascenders (b d f h k l t) using the top rows; descenders (g j p q y)
+/// compress their bowl into the upper rows so the tail still fits within
+/// the 7-row cell. Deliberately hand-authored rather than sourced from an
+/// existing font file, both to avoid a licensing question and to keep this
+/// dependency-free.
 fn font_glyph(ch: char) -> [u8; 7] {
-    let c = ch.to_ascii_uppercase();
-    match c {
+    match ch {
         'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
         'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
         'C' => [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
@@ -363,6 +362,32 @@ fn font_glyph(ch: char) -> [u8; 7] {
         'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
         'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
         'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+        'a' => [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
+        'b' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b11110],
+        'c' => [0b00000, 0b00000, 0b01110, 0b10000, 0b10000, 0b10001, 0b01110],
+        'd' => [0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10001, 0b01111],
+        'e' => [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110],
+        'f' => [0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000],
+        'g' => [0b00000, 0b01111, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
+        'h' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
+        'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'j' => [0b00010, 0b00000, 0b00110, 0b00010, 0b00010, 0b10010, 0b01100],
+        'k' => [0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010],
+        'l' => [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'm' => [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101],
+        'n' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
+        'o' => [0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110],
+        'p' => [0b00000, 0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000],
+        'q' => [0b00000, 0b01111, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001],
+        'r' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
+        's' => [0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110],
+        't' => [0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110],
+        'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
+        'v' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'w' => [0b00000, 0b00000, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
+        'x' => [0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001],
+        'y' => [0b00000, 0b10001, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
+        'z' => [0b00000, 0b00000, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111],
         '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
         '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
         '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
@@ -512,5 +537,14 @@ mod tests {
         bake(&mut img, &[Annotation::StepLabel { pos: (30.0, 30.0), number: 12, color: [0, 120, 255, 255] }]);
         let lit = img.pixels().filter(|p| p.0[0] > 0 || p.0[1] > 0 || p.0[2] > 0).count();
         assert!(lit > 0);
+    }
+    #[test]
+    fn lowercase_glyphs_are_distinct_from_uppercase_and_defined() {
+        for c in 'a'..='z' {
+            let lower = font_glyph(c);
+            let upper = font_glyph(c.to_ascii_uppercase());
+            assert_ne!(lower, [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111], "'{c}' fell through to the unsupported-glyph box");
+            assert_ne!(lower, upper, "'{c}' should differ from its uppercase glyph now that lowercase is drawn");
+        }
     }
 }

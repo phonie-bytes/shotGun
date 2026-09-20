@@ -163,6 +163,12 @@ pub struct AppConfig {
     /// not always wanted.
     #[serde(default)]
     pub auto_copy_to_clipboard: bool,
+    /// When on, the Screen tab's "Drag-Select ROI" button also opens the
+    /// annotate editor after the drag and saves the annotated result, like
+    /// Quick Region Capture does. Off by default: that button's normal job is
+    /// just to define a reusable region for later fast captures.
+    #[serde(default)]
+    pub annotate_after_manual_select: bool,
 }
 
 impl Default for AppConfig {
@@ -227,6 +233,7 @@ impl Default for AppConfig {
             cleanup_video_frames_after_encode: false,
             auto_export_pdf_on_session: false,
             auto_copy_to_clipboard: false,
+            annotate_after_manual_select: false,
         }
     }
 }
@@ -369,5 +376,19 @@ mod tests {
         assert_eq!(cfg.file_prefix, deserialized.file_prefix);
         assert_eq!(cfg.format, deserialized.format);
         assert!(deserialized.prompt_on_new_session);
+    }
+
+    /// A `config.json` written by an older version won't have fields added
+    /// since — each must default rather than fail the whole load (which
+    /// would silently reset the user's settings).
+    #[test]
+    fn older_config_without_newer_fields_still_loads() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("annotate_after_manual_select");
+        obj.remove("auto_copy_to_clipboard");
+        let restored: AppConfig = serde_json::from_value(value).expect("older config must still deserialize");
+        assert!(!restored.annotate_after_manual_select);
+        assert!(!restored.auto_copy_to_clipboard);
     }
 }
