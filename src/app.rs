@@ -156,7 +156,7 @@ impl ShotgunApp {
         visuals.widgets.active.bg_fill = Color32::from_rgb(64, 76, 96);
         cc.egui_ctx.set_visuals(visuals);
 
-        let config = AppConfig::load();
+        let mut config = AppConfig::load();
         let monitors = get_monitors();
 
         // Loads profiles.json, or (first run after upgrading) creates it
@@ -169,7 +169,22 @@ impl ShotgunApp {
             .get(config.monitor_index)
             .map(|m| m.name.clone())
             .unwrap_or_default();
-        let profiles = ProfilesFile::load_or_migrate(&config, active_monitor_name);
+        let mut profiles = ProfilesFile::load_or_migrate(&config, active_monitor_name);
+
+        // Windows can reorder monitor indices between runs (reconnects,
+        // driver changes). Profiles remember their monitor's *name*; re-point
+        // any whose index no longer matches it, and carry that over to the
+        // live config if it is the active profile's.
+        let monitor_names: Vec<String> = monitors.iter().map(|m| m.name.clone()).collect();
+        if profiles.reconcile_monitors(&monitor_names) {
+            let _ = profiles.save();
+            if let Some(active) = profiles.active() {
+                if config.monitor_index != active.monitor_index {
+                    config.monitor_index = active.monitor_index;
+                    let _ = config.save();
+                }
+            }
+        }
 
         // Determine initial UI indices for hotkeys
         let temp_capture_key_idx = AVAILABLE_KEYS
@@ -290,6 +305,7 @@ impl ShotgunApp {
                 if self.history.len() > 100 {
                     self.history.pop();
                 }
+                self.sync_active_profile();
             }
             Err(err) => {
                 self.status_message = format!("❌ Capture error: {err}");
@@ -336,6 +352,7 @@ impl ShotgunApp {
                 if self.history.len() > 100 {
                     self.history.pop();
                 }
+                self.sync_active_profile();
             }
             Err(err) => {
                 self.status_message = format!("❌ Capture error: {err}");
@@ -443,6 +460,7 @@ impl ShotgunApp {
             self.config.session_index, self.config.start_index
         );
         self.maybe_auto_export_session_pdf(ending_session);
+        self.sync_active_profile();
     }
 
     pub fn apply_new_session_from_modal(&mut self) {
@@ -462,6 +480,7 @@ impl ShotgunApp {
             self.config.output_dir.file_name().unwrap_or_default().to_string_lossy()
         );
         self.maybe_auto_export_session_pdf(ending_session);
+        self.sync_active_profile();
     }
 
     /// If enabled in Settings, bundles the screenshots captured during
@@ -588,6 +607,7 @@ impl ShotgunApp {
         if self.config.monitor_index != monitor_index {
             self.config.monitor_index = monitor_index;
             let _ = self.config.save();
+            self.sync_active_profile();
         }
 
         self.start_drag_select_overlay(ctx);
@@ -922,6 +942,22 @@ impl ShotgunApp {
         }
     }
 
+    /// Writes the live settings back into the active profile and saves
+    /// `profiles.json`. The live config is the source of truth for the
+    /// active profile between switches (captures advance its counter there),
+    /// so this keeps the stored copy from going stale, which matters if the
+    /// app is killed or restarted rather than switched.
+    fn sync_active_profile(&mut self) {
+        let monitor_name = self.monitors.get(self.config.monitor_index).map(|m| m.name.clone());
+        if let Some(active) = self.profiles.active_mut() {
+            active.update_from_config(&self.config);
+            if let Some(name) = monitor_name {
+                active.monitor_name = name;
+            }
+        }
+        let _ = self.profiles.save();
+    }
+
     /// Switches the active capture profile: writes the current live
     /// settings back into whichever profile was active before switching
     /// (so nothing typed is lost), then loads `target_id`'s saved values
@@ -1093,6 +1129,13 @@ impl ShotgunApp {
 }
 
 impl eframe::App for ShotgunApp {
+    /// Last chance to persist: settings edited on the Screen/Output tabs go
+    /// straight to the live config, so write them back into the active
+    /// profile before the app goes away.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.sync_active_profile();
+    }
+
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
@@ -1732,6 +1775,7 @@ impl ShotgunApp {
             if self.monitors.is_empty() {
                 ui.colored_label(Color32::from_rgb(255, 100, 100), "No monitors detected!");
             } else {
+                let mut newly_selected: Option<usize> = None;
                 for (idx, mon) in self.monitors.iter().enumerate() {
                     let is_selected = self.config.monitor_index == idx;
                     let primary_badge = if mon.is_primary { " [Primary]" } else { "" };
@@ -1746,9 +1790,15 @@ impl ShotgunApp {
                     );
 
                     if ui.selectable_label(is_selected, label_text).clicked() {
-                        self.config.monitor_index = idx;
-                        let _ = self.config.save();
+                        newly_selected = Some(idx);
                     }
+                }
+                // Applied after the loop: syncing needs `&mut self`, which
+                // can't overlap the borrow of `self.monitors` above.
+                if let Some(idx) = newly_selected {
+                    self.config.monitor_index = idx;
+                    let _ = self.config.save();
+                    self.sync_active_profile();
                 }
             }
         });

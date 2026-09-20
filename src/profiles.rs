@@ -39,9 +39,9 @@ pub struct CaptureProfile {
     pub name: String,
     pub kind: ProfileKind,
     pub monitor_index: usize,
-    /// Matched by name first when possible (see nowhere yet — tracked for a
-    /// future "monitor reconnected in a different order" reconciliation;
-    /// for now this is informational only, `monitor_index` is what's used).
+    /// The monitor's name when this profile was last saved. `monitor_index`
+    /// is what capture actually uses; `reconcile_monitor` re-points it by
+    /// this name when Windows reorders monitors.
     pub monitor_name: String,
     pub region: Option<RectRegion>,
     pub output_dir: PathBuf,
@@ -89,6 +89,37 @@ impl CaptureProfile {
             auto_copy_to_clipboard: config.auto_copy_to_clipboard,
             auto_export_pdf_on_session: config.auto_export_pdf_on_session,
         }
+    }
+
+    /// Re-points `monitor_index` at whichever monitor currently has this
+    /// profile's recorded `monitor_name`. Windows can hand out monitor
+    /// indices in a different order after a reconnect or a driver change,
+    /// which would otherwise silently aim the profile at the wrong screen.
+    ///
+    /// If the named monitor isn't present (unplugged), the index is left
+    /// alone unless it's now out of range, in which case it falls back to 0.
+    /// A profile with no recorded name just adopts the name of whatever its
+    /// index currently points at. Returns whether anything changed.
+    pub fn reconcile_monitor(&mut self, monitor_names: &[String]) -> bool {
+        if self.monitor_name.is_empty() {
+            if let Some(name) = monitor_names.get(self.monitor_index) {
+                self.monitor_name = name.clone();
+                return true;
+            }
+            return false;
+        }
+        if let Some(idx) = monitor_names.iter().position(|n| *n == self.monitor_name) {
+            if idx != self.monitor_index {
+                self.monitor_index = idx;
+                return true;
+            }
+            return false;
+        }
+        if self.monitor_index >= monitor_names.len() && !monitor_names.is_empty() {
+            self.monitor_index = 0;
+            return true;
+        }
+        false
     }
 
     /// Copies this profile's fields into the live config — the "switch to"
@@ -195,6 +226,15 @@ impl ProfilesFile {
         };
         let _ = file.save();
         file
+    }
+
+    /// Runs `reconcile_monitor` over every profile; true if any changed.
+    pub fn reconcile_monitors(&mut self, monitor_names: &[String]) -> bool {
+        let mut changed = false;
+        for p in &mut self.profiles {
+            changed |= p.reconcile_monitor(monitor_names);
+        }
+        changed
     }
 
     pub fn active(&self) -> Option<&CaptureProfile> {
@@ -322,5 +362,38 @@ mod tests {
         let restored: ProfilesFile = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.active_profile_id.as_deref(), Some("teams"));
         assert_eq!(restored.profiles[0].file_prefix, "teams_");
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reconcile_follows_the_monitor_by_name_when_indices_reorder() {
+        let mut p = CaptureProfile::from_config(&AppConfig::default(), "t".into(), "T".into(), ProfileKind::Screenshot, "DISPLAY5".into());
+        p.monitor_index = 1;
+        // DISPLAY5 used to be index 1; after a reconnect it is index 2.
+        assert!(p.reconcile_monitor(&names(&["DISPLAY1", "DISPLAY7", "DISPLAY5"])));
+        assert_eq!(p.monitor_index, 2);
+        // Already correct: nothing to do.
+        assert!(!p.reconcile_monitor(&names(&["DISPLAY1", "DISPLAY7", "DISPLAY5"])));
+    }
+
+    #[test]
+    fn reconcile_keeps_index_when_named_monitor_is_unplugged_unless_out_of_range() {
+        let mut p = CaptureProfile::from_config(&AppConfig::default(), "t".into(), "T".into(), ProfileKind::Screenshot, "GONE".into());
+        p.monitor_index = 1;
+        assert!(!p.reconcile_monitor(&names(&["DISPLAY1", "DISPLAY7"])), "named monitor missing but index valid: leave it");
+        p.monitor_index = 5;
+        assert!(p.reconcile_monitor(&names(&["DISPLAY1", "DISPLAY7"])));
+        assert_eq!(p.monitor_index, 0, "out-of-range index falls back to the first monitor");
+    }
+
+    #[test]
+    fn reconcile_adopts_a_name_for_profiles_that_have_none() {
+        let mut p = CaptureProfile::from_config(&AppConfig::default(), "t".into(), "T".into(), ProfileKind::Screenshot, String::new());
+        p.monitor_index = 1;
+        assert!(p.reconcile_monitor(&names(&["DISPLAY1", "DISPLAY7"])));
+        assert_eq!(p.monitor_name, "DISPLAY7");
     }
 }
