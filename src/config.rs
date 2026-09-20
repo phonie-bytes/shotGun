@@ -174,6 +174,12 @@ pub struct AppConfig {
     /// video itself. On by default: a live recording should be obvious.
     #[serde(default = "default_true")]
     pub show_recording_border: bool,
+    /// Bind Ctrl+Alt+1..9 to "switch to the Nth profile, then capture (or
+    /// start/stop recording for a video profile)". Off by default: on
+    /// keyboard layouts that use AltGr (Ctrl+Alt) to type characters, these
+    /// combinations produce text, and claiming them globally would break that.
+    #[serde(default)]
+    pub profile_hotkeys_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -240,6 +246,7 @@ impl Default for AppConfig {
             auto_copy_to_clipboard: false,
             annotate_after_manual_select: false,
             show_recording_border: true,
+            profile_hotkeys_enabled: false,
         }
     }
 }
@@ -397,10 +404,12 @@ mod tests {
         let obj = value.as_object_mut().unwrap();
         obj.remove("annotate_after_manual_select");
         obj.remove("show_recording_border");
+        obj.remove("profile_hotkeys_enabled");
         obj.remove("auto_copy_to_clipboard");
         let restored: AppConfig = serde_json::from_value(value).expect("older config must still deserialize");
         assert!(!restored.annotate_after_manual_select);
         assert!(restored.show_recording_border, "the border defaults on for configs that predate the setting");
+        assert!(!restored.profile_hotkeys_enabled, "profile hotkeys stay opt-in");
         assert!(!restored.auto_copy_to_clipboard);
     }
 }

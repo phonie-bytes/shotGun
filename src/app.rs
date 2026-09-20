@@ -8,8 +8,8 @@ use crate::hotkey::{
 };
 use crate::overlay::{OverlayAction, RegionSelectorOverlay};
 use crate::pdf_export;
-use crate::profiles::{CaptureProfile, ProfileKind, ProfilesFile};
-use crate::tray::{TrayAction, TrayHandler};
+use crate::profiles::{profile_hotkey_action, CaptureProfile, ProfileHotkeyAction, ProfileKind, ProfilesFile};
+use crate::tray::{TrayAction, TrayHandler, TrayProfileEntry};
 use crate::video;
 use crossbeam_channel::Receiver;
 use egui::{
@@ -83,6 +83,12 @@ pub struct ShotgunApp {
     /// window has fully restored — no separate Capture press needed.
     pub pending_quick_capture: bool,
     pub tray_handler: Option<TrayHandler>,
+    /// What the tray's "Switch Profile" submenu currently shows, so it is
+    /// only rebuilt when the profile list or the active profile changes.
+    pub tray_profile_entries: Vec<TrayProfileEntry>,
+    /// How many Ctrl+Alt+N profile hotkeys the hotkey thread has bound, so
+    /// they're re-bound only when that number changes.
+    pub profile_hotkeys_bound: usize,
     pub window_visible: bool,
     /// Tracks the OS-reported minimized state from the previous frame, so
     /// `maybe_toggle_taskbar_for_minimize` can act only on the transition
@@ -266,6 +272,8 @@ impl ShotgunApp {
             pending_restore_size: None,
             pending_quick_capture: false,
             tray_handler,
+            tray_profile_entries: Vec::new(),
+            profile_hotkeys_bound: 0,
             window_visible: true,
             was_minimized: false,
             autostart_state,
@@ -1025,6 +1033,63 @@ impl ShotgunApp {
         self.status_message = format!("📂 Switched to profile: {target_name}");
     }
 
+    /// Keeps the tray's "Switch Profile" submenu matching the profile list.
+    fn sync_tray_profiles(&mut self) {
+        let active = self.profiles.active_profile_id.clone();
+        let entries: Vec<TrayProfileEntry> = self
+            .profiles
+            .profiles
+            .iter()
+            .map(|p| TrayProfileEntry {
+                id: p.id.clone(),
+                label: format!("{} {}", p.kind.label(), p.name),
+                active: active.as_deref() == Some(p.id.as_str()),
+            })
+            .collect();
+        if entries != self.tray_profile_entries {
+            if let Some(tray) = &mut self.tray_handler {
+                tray.set_profiles(&entries);
+            }
+            self.tray_profile_entries = entries;
+        }
+    }
+
+    /// Binds Ctrl+Alt+1..N for the N profiles (max 9) when enabled, or
+    /// nothing when disabled. Only as many as there are profiles, so unused
+    /// combinations stay free for other programs.
+    fn sync_profile_hotkeys(&mut self) {
+        let wanted = if self.config.profile_hotkeys_enabled {
+            self.profiles.profiles.len().min(crate::hotkey::MAX_PROFILE_HOTKEYS)
+        } else {
+            0
+        };
+        if wanted != self.profile_hotkeys_bound {
+            self.hotkey_manager.set_profile_hotkeys(wanted);
+            self.profile_hotkeys_bound = wanted;
+        }
+    }
+
+    /// Ctrl+Alt+N: select the Nth profile and do its job — take a screenshot,
+    /// or start/stop recording for a video profile.
+    fn handle_profile_hotkey(&mut self, slot: usize) {
+        let Some(profile) = self.profiles.profiles.get(slot) else {
+            self.status_message = format!("No profile in slot {}.", slot + 1);
+            return;
+        };
+        let (id, kind) = (profile.id.clone(), profile.kind);
+        match profile_hotkey_action(kind, self.video_handle.is_some()) {
+            ProfileHotkeyAction::CaptureNow => {
+                self.switch_to_profile(&id);
+                self.do_capture();
+            }
+            ProfileHotkeyAction::StartVideo => {
+                self.switch_to_profile(&id);
+                self.start_video();
+            }
+            ProfileHotkeyAction::StopVideo => self.stop_video(),
+        }
+    }
+
     /// Creates a new profile snapshotting the *current* live settings (so
     /// if you're already looking at what you want, naming it is all that's
     /// needed), then switches to it.
@@ -1181,6 +1246,9 @@ impl eframe::App for ShotgunApp {
         self.maybe_toggle_taskbar_for_minimize(ctx, frame);
         self.handle_close_request(ctx, frame);
 
+        self.sync_tray_profiles();
+        self.sync_profile_hotkeys();
+
         // 1. Process System Tray Events
         if let Some(tray) = &self.tray_handler {
             if let Some(action) = tray.check_events() {
@@ -1193,6 +1261,9 @@ impl eframe::App for ShotgunApp {
                     }
                     TrayAction::TriggerNewSession => {
                         self.trigger_new_session(ctx);
+                    }
+                    TrayAction::SwitchProfile(id) => {
+                        self.switch_to_profile(&id);
                     }
                     TrayAction::ExitApp => {
                         if self.video_encoding || self.pdf_export_rx.is_some() {
@@ -1227,6 +1298,13 @@ impl eframe::App for ShotgunApp {
                 }
                 HotkeyEvent::Triggered(HotkeyAction::QuickCapture) => {
                     self.trigger_quick_region_capture(ctx);
+                }
+                HotkeyEvent::Triggered(HotkeyAction::Profile(slot)) => {
+                    self.handle_profile_hotkey(slot);
+                }
+                HotkeyEvent::ProfileHotkeysUnavailable(slots) => {
+                    let labels: Vec<String> = slots.iter().map(|&i| crate::hotkey::profile_hotkey_label(i)).collect();
+                    self.status_message = format!("⚠️ Couldn't bind {} — another program already uses it.", labels.join(", "));
                 }
                 HotkeyEvent::RegisteredStatus {
                     capture_ok,
@@ -1556,14 +1634,18 @@ impl ShotgunApp {
                 let mut duplicate_id: Option<String> = None;
                 let mut delete_id: Option<String> = None;
 
+                let hotkeys_on = self.config.profile_hotkeys_enabled;
                 ScrollArea::vertical().max_height(140.0).id_salt("profile_manager_list").show(ui, |ui| {
-                    for profile in &self.profiles.profiles {
+                    for (slot, profile) in self.profiles.profiles.iter().enumerate() {
                         ui.horizontal(|ui| {
                             let is_editing = self.profile_editing_id.as_deref() == Some(profile.id.as_str());
                             let is_active = active_id.as_deref() == Some(profile.id.as_str());
                             let label = format!("{}{} {}", if is_active { "🔘 " } else { "⚪ " }, profile.kind.label(), profile.name);
                             if ui.selectable_label(is_editing, label).clicked() {
                                 select_id = Some(profile.id.clone());
+                            }
+                            if hotkeys_on && slot < crate::hotkey::MAX_PROFILE_HOTKEYS {
+                                ui.label(RichText::new(crate::hotkey::profile_hotkey_label(slot)).size(10.5).color(Color32::GRAY));
                             }
                             if ui.small_button("⧉").on_hover_text("Duplicate").clicked() {
                                 duplicate_id = Some(profile.id.clone());
@@ -1605,6 +1687,16 @@ impl ShotgunApp {
                         self.profile_pending_delete = None;
                     }
                 }
+
+                ui.add_space(4.0);
+                if ui.checkbox(&mut self.config.profile_hotkeys_enabled, "Profile hotkeys: Ctrl+Alt+1 … Ctrl+Alt+9").changed() {
+                    let _ = self.config.save();
+                }
+                ui.label(
+                    RichText::new("Pressing Ctrl+Alt+N switches to the Nth profile in the list above, then captures (screenshot profile) or starts/stops recording (video profile). Off by default: on keyboards that use AltGr, Ctrl+Alt+digit types characters.")
+                        .size(10.5)
+                        .color(Color32::GRAY),
+                );
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {

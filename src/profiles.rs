@@ -21,6 +21,28 @@ pub enum ProfileKind {
     Video,
 }
 
+/// What a profile hotkey (Ctrl+Alt+N) does once its profile is selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileHotkeyAction {
+    /// Switch to the profile, then take a screenshot with its settings.
+    CaptureNow,
+    /// Switch to the video profile, then start recording.
+    StartVideo,
+    /// A recording is running: stop it (no profile switch — the recording
+    /// belongs to whatever was active when it started).
+    StopVideo,
+}
+
+/// Screenshot profiles always capture; video profiles toggle recording, so
+/// the same key that started a recording also ends it.
+pub fn profile_hotkey_action(kind: ProfileKind, recording: bool) -> ProfileHotkeyAction {
+    match (kind, recording) {
+        (ProfileKind::Screenshot, _) => ProfileHotkeyAction::CaptureNow,
+        (ProfileKind::Video, false) => ProfileHotkeyAction::StartVideo,
+        (ProfileKind::Video, true) => ProfileHotkeyAction::StopVideo,
+    }
+}
+
 impl ProfileKind {
     pub fn label(&self) -> &'static str {
         match self {
@@ -362,6 +384,15 @@ mod tests {
         let restored: ProfilesFile = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.active_profile_id.as_deref(), Some("teams"));
         assert_eq!(restored.profiles[0].file_prefix, "teams_");
+    }
+
+    #[test]
+    fn profile_hotkeys_capture_or_toggle_recording() {
+        use ProfileHotkeyAction::*;
+        assert_eq!(profile_hotkey_action(ProfileKind::Screenshot, false), CaptureNow);
+        assert_eq!(profile_hotkey_action(ProfileKind::Screenshot, true), CaptureNow);
+        assert_eq!(profile_hotkey_action(ProfileKind::Video, false), StartVideo);
+        assert_eq!(profile_hotkey_action(ProfileKind::Video, true), StopVideo);
     }
 
     fn names(v: &[&str]) -> Vec<String> {

@@ -18,6 +18,41 @@ pub const HOTKEY_ID_VIDEO_START: i32 = 2001;
 pub const HOTKEY_ID_VIDEO_STOP: i32 = 2002;
 pub const HOTKEY_ID_TOGGLE_WINDOW: i32 = 3001;
 pub const HOTKEY_ID_QUICK_CAPTURE: i32 = 4001;
+/// Per-profile hotkeys use ids `5001..=5009` (Ctrl+Alt+1 ..= Ctrl+Alt+9).
+pub const HOTKEY_ID_PROFILE_BASE: i32 = 5000;
+pub const MAX_PROFILE_HOTKEYS: usize = 9;
+/// `MOD_NOREPEAT | MOD_CONTROL | MOD_ALT`.
+const PROFILE_HOTKEY_MODIFIERS: u32 = 0x4000 | 0x0002 | 0x0001;
+
+/// The label for profile slot `index` (0-based), e.g. `Ctrl+Alt+1`.
+pub fn profile_hotkey_label(index: usize) -> String {
+    format!("Ctrl+Alt+{}", index + 1)
+}
+
+/// (Re)registers Ctrl+Alt+1 ..= Ctrl+Alt+`count`, dropping any previous
+/// profile hotkeys first. Returns the 0-based slots Windows refused (another
+/// program already owns the combination).
+fn register_profile_hotkeys(count: usize) -> Vec<usize> {
+    let mut failed = Vec::new();
+    unsafe {
+        for i in 0..MAX_PROFILE_HOTKEYS {
+            UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_PROFILE_BASE + 1 + i as i32);
+        }
+        for i in 0..count.min(MAX_PROFILE_HOTKEYS) {
+            // '1'..'9' are virtual-key codes 0x31..0x39.
+            let ok = RegisterHotKey(
+                std::ptr::null_mut(),
+                HOTKEY_ID_PROFILE_BASE + 1 + i as i32,
+                PROFILE_HOTKEY_MODIFIERS,
+                0x31 + i as u32,
+            ) != 0;
+            if !ok {
+                failed.push(i);
+            }
+        }
+    }
+    failed
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyAction {
@@ -27,6 +62,8 @@ pub enum HotkeyAction {
     VideoStop,
     ToggleWindow,
     QuickCapture,
+    /// Ctrl+Alt+N for the profile in 0-based slot N-1.
+    Profile(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +78,8 @@ pub enum HotkeyEvent {
         quick_capture_ok: bool,
         error_msg: Option<String>,
     },
+    /// Some profile hotkeys couldn't be bound (0-based slots).
+    ProfileHotkeysUnavailable(Vec<usize>),
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +122,8 @@ enum HotkeyCommand {
         toggle_window: HotkeyConfig,
         quick_capture: HotkeyConfig,
     },
+    /// Bind Ctrl+Alt+1..=count for profile switching (0 unbinds them all).
+    SetProfileHotkeys(usize),
     Shutdown,
 }
 
@@ -217,7 +258,14 @@ impl HotkeyManager {
                                 quick_capture_cfg = quick_capture;
                                 register_keys(&cap_cfg, &sess_cfg, &vid_start_cfg, &vid_stop_cfg, &toggle_cfg, &quick_capture_cfg, &event_tx);
                             }
+                            HotkeyCommand::SetProfileHotkeys(count) => {
+                                let failed = register_profile_hotkeys(count);
+                                if !failed.is_empty() {
+                                    let _ = event_tx.send(HotkeyEvent::ProfileHotkeysUnavailable(failed));
+                                }
+                            }
                             HotkeyCommand::Shutdown => {
+                                register_profile_hotkeys(0);
                                 unsafe {
                                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_CAPTURE);
                                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_NEW_SESSION);
@@ -246,6 +294,9 @@ impl HotkeyManager {
                                     HOTKEY_ID_VIDEO_STOP => HotkeyAction::VideoStop,
                                     HOTKEY_ID_TOGGLE_WINDOW => HotkeyAction::ToggleWindow,
                                     HOTKEY_ID_QUICK_CAPTURE => HotkeyAction::QuickCapture,
+                                    n if (HOTKEY_ID_PROFILE_BASE + 1..=HOTKEY_ID_PROFILE_BASE + MAX_PROFILE_HOTKEYS as i32).contains(&n) => {
+                                        HotkeyAction::Profile((n - HOTKEY_ID_PROFILE_BASE - 1) as usize)
+                                    }
                                     _ => continue,
                                 };
                                 let _ = event_tx.send(HotkeyEvent::Triggered(action));
@@ -258,6 +309,7 @@ impl HotkeyManager {
                 }
 
                 // Cleanup on exit
+                register_profile_hotkeys(0);
                 unsafe {
                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_CAPTURE);
                     UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID_NEW_SESSION);
@@ -290,6 +342,11 @@ impl HotkeyManager {
             toggle_window,
             quick_capture,
         });
+    }
+
+    /// Binds Ctrl+Alt+1..=`count` as profile hotkeys (0 removes them).
+    pub fn set_profile_hotkeys(&self, count: usize) {
+        let _ = self.cmd_tx.send(HotkeyCommand::SetProfileHotkeys(count));
     }
 
     /// Graceful shutdown.
