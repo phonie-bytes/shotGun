@@ -109,6 +109,9 @@ pub struct ShotgunApp {
     /// When the current recording started, for the live "REC 00:01:23"
     /// timer shown next to the Stop Video button.
     pub recording_started_at: Option<std::time::Instant>,
+    /// The pulsing frame around the recorded area; alive exactly as long as
+    /// `video_handle` is (dropping it removes the windows).
+    pub recording_border: Option<crate::rec_border::RecordingBorder>,
     /// Async PDF export in flight, if any: (label to prefix the status
     /// message with once done, receiver for the result).
     pub pdf_export_rx: Option<(String, Receiver<Result<PathBuf, String>>)>,
@@ -277,6 +280,7 @@ impl ShotgunApp {
             video_result_rx: None,
             video_encoding: false,
             recording_started_at: None,
+            recording_border: None,
             pdf_export_rx: None,
             pending_exit: false,
             exit_confirmed: false,
@@ -390,6 +394,12 @@ impl ShotgunApp {
         self.video_handle = Some(handle);
         self.video_result_rx = Some(result_rx);
         self.recording_started_at = Some(std::time::Instant::now());
+        if self.config.show_recording_border {
+            if let Some(mon) = self.monitors.get(self.config.monitor_index).or_else(|| self.monitors.first()) {
+                let rect = crate::rec_border::ScreenRect::for_recording(mon.x, mon.y, mon.width, mon.height, self.config.region);
+                self.recording_border = Some(crate::rec_border::RecordingBorder::start(rect));
+            }
+        }
         self.status_message = "⏺️ Video recording started.".to_string();
     }
 
@@ -404,6 +414,8 @@ impl ShotgunApp {
                 self.status_message = "⏳ Stopping & encoding video...".to_string();
                 self.video_encoding = true;
                 self.recording_started_at = None;
+                // Drop the border first so it's gone the instant recording ends.
+                self.recording_border = None;
                 handle.stop();
             }
             None => {
@@ -2333,6 +2345,16 @@ impl ShotgunApp {
             }
             ui.label(
                 RichText::new("Quick Region Capture always annotates. This makes the Screen tab's Drag-Select button do the same, so it captures and saves instead of only remembering the region.")
+                    .size(10.5)
+                    .color(Color32::GRAY),
+            );
+
+            ui.add_space(4.0);
+            if ui.checkbox(&mut self.config.show_recording_border, "Show a pulsing red border around the area being recorded").changed() {
+                let _ = self.config.save();
+            }
+            ui.label(
+                RichText::new("Only you see it: it's excluded from capture, so it never appears in the video. Takes effect on the next recording.")
                     .size(10.5)
                     .color(Color32::GRAY),
             );

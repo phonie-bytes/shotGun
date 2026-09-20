@@ -169,6 +169,11 @@ pub struct AppConfig {
     /// just to define a reusable region for later fast captures.
     #[serde(default)]
     pub annotate_after_manual_select: bool,
+    /// Show a pulsing red frame around the recorded area while a video is
+    /// recording. It is excluded from capture, so it never appears in the
+    /// video itself. On by default: a live recording should be obvious.
+    #[serde(default = "default_true")]
+    pub show_recording_border: bool,
 }
 
 impl Default for AppConfig {
@@ -234,8 +239,13 @@ impl Default for AppConfig {
             auto_export_pdf_on_session: false,
             auto_copy_to_clipboard: false,
             annotate_after_manual_select: false,
+            show_recording_border: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_video_fps() -> u32 {
@@ -386,9 +396,11 @@ mod tests {
         let mut value = serde_json::to_value(AppConfig::default()).unwrap();
         let obj = value.as_object_mut().unwrap();
         obj.remove("annotate_after_manual_select");
+        obj.remove("show_recording_border");
         obj.remove("auto_copy_to_clipboard");
         let restored: AppConfig = serde_json::from_value(value).expect("older config must still deserialize");
         assert!(!restored.annotate_after_manual_select);
+        assert!(restored.show_recording_border, "the border defaults on for configs that predate the setting");
         assert!(!restored.auto_copy_to_clipboard);
     }
 }

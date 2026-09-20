@@ -12,6 +12,7 @@ mod hotkey;
 mod overlay;
 mod pdf_export;
 mod profiles;
+mod rec_border;
 mod tray;
 mod video;
 
