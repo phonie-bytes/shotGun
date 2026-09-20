@@ -19,8 +19,9 @@
 
 ## 🌟 Key Features (v0.4.0)
 
-- 🗂️ **Capture Profiles**: Named, switchable capture setups — e.g. a "Teams" profile with its own region/output folder/filename prefix, and a separate "Video Recording" profile with its own monitor/fps/output — switch between them with one click instead of re-pointing settings every time.
-- 🖌️ **Post-Capture Annotation Editor**: After a Quick Region Capture, annotate directly on the frozen overlay before saving — Arrow, Rectangle, Highlighter, Text, Blur/Pixelate (adjustable strength), Redact (solid opaque), and numbered Step Labels, with a color picker and full undo.
+- 🗂️ **Capture Profiles**: Named, switchable capture setups — e.g. a "Teams" profile with its own region/output folder/filename prefix, and a separate "Video Recording" profile with its own monitor/fps/output — switch between them with one click, from the tray's *Switch Profile* submenu, or (opt-in) with `Ctrl+Alt+1..9`, which switches *and* captures / starts-stops recording in one press.
+- 🔴 **Recording Border**: a pulsing red frame around the area being recorded (only you see it — it's excluded from capture, so it never appears in the video). Toggle in Settings.
+- 🖌️ **Post-Capture Annotation Editor**: After a Quick Region Capture, annotate directly on the frozen overlay before saving — Arrow, Rectangle, Highlighter, Text, Blur/Pixelate (adjustable strength), Redact (solid opaque), and numbered Step Labels (with a real lowercase font), a color picker and full undo. Optionally also runs after the manual Drag-Select button.
 
 - 🖥️ **Multi-Monitor Support**: Automatically detects all connected displays, resolutions, positions, scale factors, and primary status.
 - ✂️ **Interactive Drag-Select Overlay**: Freeze the screen and drag a bounding box with live pixel dimension badges and coordinates to define your ROI.
@@ -28,7 +29,7 @@
 - 🔄 **Interactive Session Reset Dialog**: When starting a new session (hotkey `F10`), easily customize the target directory, session name, file prefix, and starting number on the fly.
 - 🎥 **Video Recording with Audio**: Record the selected ROI to MP4 via DXGI Desktop Duplication, with system audio muxed in via WASAPI loopback capture. See [Video Recording](#-video-recording) below.
 - 📄 **Multi-Screenshot PDF Export**: Bundle a session's screenshots into a single PDF — export the current History tab manually at any time, or auto-export whenever a session ends (opt-in).
-- 📥 **System Tray Integration**: Minimize shotGun to the Windows system tray with a native context menu (*Show/Hide*, *Capture Region*, *Start New Session*, *Exit*).
+- 📥 **System Tray Integration**: Minimize shotGun to the Windows system tray with a native context menu (*Show/Hide*, *Capture Region*, *Start New Session*, *Switch Profile*, *Exit*).
 - 🚀 **Windows Auto-Start**: Easily toggle automatic startup on Windows boot via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 - ⌨️ **Global OS Hotkeys**: Works across any window, fullscreen game, or background app using native Win32 `RegisterHotKey` (zero polling CPU overhead) — Capture, New Session, Video Start/Stop, and Show/Hide Window (a guaranteed way back in if the window ever gets hidden).
 - 🔢 **Sequential Filename Incrementing**: Automatically formats filenames with configurable zero-padding (e.g. `shot_001.png`, `shot_002.png`, `shot_003.png`).
@@ -37,7 +38,7 @@
   - **JPEG** (Configurable 1–100% quality slider)
   - **BMP** (Raw uncompressed bitmap)
   - **WebP** (Modern efficient compression)
-- 📋 **History & Clipboard Integration**: View capture history with resolution, file size, timestamp, one-click open, locate in Windows Explorer, or copy image directly to the system clipboard.
+- 📋 **History & Clipboard Integration**: View capture history with resolution, file size, timestamp, one-click open, locate in Windows Explorer, or copy image directly to the system clipboard. Finished video recordings get their own list with Play / Locate / Copy, where Copy puts the MP4 on the clipboard *as a file* so it pastes into Explorer, chat or email.
 - 🔊 **Audio Feedback**: Subtle Windows audio chime on capture (toggleable).
 - 📐 **Compact & Clean UI**: Redesigned lightweight window footprint (~580×440 px).
 - ⚙️ **Persistent Configuration**: Automatically saves settings to `config.json` between runs.
@@ -101,6 +102,7 @@
 ### 5. Record Video
 - Click **⏺ Record Video** in the header (or use the Video Start/Stop hotkeys, default `F12` / `Shift+F12`).
 - Click **⏹ Stop Video** when done; the status bar reports the result once encoding finishes.
+- While recording, a pulsing red border marks the recorded area (turn it off in Settings if you prefer); it does not appear in the video. Finished recordings appear on the **📜 History** tab, where **📋 Copy** copies the file for pasting elsewhere.
 - Configure **Target FPS** and an optional **ffmpeg Path** (auto-detected from the app folder or PATH otherwise) on the Settings tab, along with an option to delete the intermediate PNG frames/audio.wav once the MP4 is successfully created.
 
 ### 6. Export Screenshots to PDF
@@ -147,15 +149,19 @@ shotGun
 ├── src/
 │   ├── main.rs         # Application entry point & eframe window setup
 │   ├── app.rs          # egui UI layout, tabs, modal dialogs, and history
-│   ├── audio.rs        # WASAPI loopback system-audio capture to WAV
+│   ├── annotate.rs     # Annotation model + rasterizer (arrows, boxes, blur, redact, text)
+│   ├── audio.rs        # WASAPI loopback system-audio capture to WAV (with silence gap-filling)
 │   ├── autostart.rs    # Windows Startup registry management (HKCU/.../Run)
 │   ├── capture.rs      # Screenshot capture engine (xcap), ROI cropping & image encoders
+│   ├── clipboard_files.rs # Copy a file to the clipboard (CF_HDROP) for pasting videos
 │   ├── config.rs       # Configuration model, Serde serialization & defaults
 │   ├── dxgi_capture.rs # Direct DXGI Desktop Duplication (multi-adapter aware)
 │   ├── hotkey.rs       # Dedicated Win32 RegisterHotKey message loop thread & channels
 │   ├── overlay.rs      # Interactive fullscreen freeze-frame region selection tool
 │   ├── pdf_export.rs   # Combines captured screenshots into a PDF (printpdf)
-│   ├── tray.rs         # System tray icon with context menu & event dispatcher
+│   ├── profiles.rs     # Capture Profiles: model, profiles.json, monitor reconciliation
+│   ├── rec_border.rs   # Pulsing recording border (capture-excluded layered windows)
+│   ├── tray.rs         # System tray icon, context menu (incl. Switch Profile) & event dispatcher
 │   └── video.rs        # Video recording orchestration: capture + audio + ffmpeg mux
 ├── Cargo.toml          # Dependencies & package metadata (Noerotech)
 ├── README.md           # Comprehensive user & developer guide

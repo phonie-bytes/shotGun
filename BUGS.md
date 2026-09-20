@@ -23,6 +23,7 @@ This document tracks known issues, platform-specific edge cases, and their resol
 - **How shotGun Handles This**:
   - The background thread detects registration failures immediately and dispatches an error status event.
   - The top bar UI turns red (`🔴 Failed to bind Capture - hotkey conflict`) and alerts the user to choose another modifier/key combination.
+  - The optional profile hotkeys (`Ctrl+Alt+1..9`) are **opt-in** for a related reason: on layouts where AltGr = Ctrl+Alt (German, Polish, Czech, …), Ctrl+Alt+digit types characters such as `{ [ ]`, and registering it globally would break typing. Only as many combos as there are profiles are bound, and a refused one is reported in the status bar.
 
 ### 4. Negative Virtual Screen Coordinates in Multi-Monitor Layouts
 - **Symptom**: Secondary monitors placed to the left or above the primary monitor have negative `(x, y)` coordinates.
@@ -82,6 +83,20 @@ This document tracks known issues, platform-specific edge cases, and their resol
 - **How shotGun Handles This**: for the active profile the editor first pulls live state into the profile (`update_from_config`, so the live `counter`/`session_index` — which advance with every capture, not in the stored copy — aren't rolled back), applies the edit, then pushes it out (`write_into_config` + save). Region picks from the editor's Drag-Select button take the same path when the target is the active profile. Covered by the unit test `editing_active_profile_writes_through_without_rolling_back_live_counter`; the live editor UI itself wasn't driven end-to-end (see TODO.md).
 - **Design consequence worth knowing**: because the live config *is* the active profile's working copy, anything that edits it — the Screen tab's Drag-Select/coordinates and Quick Region Capture — changes the active profile too.
 - **Testing note**: two things made UI automation misleading here and are worth remembering — a title match for `'shotGun'` also matches a *Windows Terminal* whose tab is named after the repo path (match the exact window title instead), and `SetCursorPos` to where the cursor already is generates no mouse-move, so egui never sees the pointer over the button (approach from elsewhere first). And automated input can't be trusted while someone else is using the same window.
+
+### 14. Audio Ran Short When Nothing Was Playing (WASAPI Loopback Gaps)
+- **Symptom**: a recording with quiet stretches produced a WAV shorter than the video, so audio drifted early against the picture.
+- **Cause**: WASAPI loopback only delivers packets while something is *rendering* audio. Silence is the absence of data, not a stream of zeros, so the captured samples simply skipped those stretches.
+- **How shotGun Handles This**: `GapFiller` (`src/audio.rs`) tracks how many frames *should* exist by wall-clock time and pads zeros whenever the captured count falls behind by more than 50 ms, with a final flush before stopping. **Lesson**: the clock must start at thread entry, not after `IAudioClient::Start()` — that call blocks ~260 ms, and starting the clock afterwards left every recording ~0.26 s short. The real-device test (`loopback_capture_produces_a_wav_file`) measures from *before* the thread spawns and asserts the WAV duration within ±0.25 s; it initially failed at 1.66 s and 1.74 s, which is how both the device-setup latency and the `Start()` delay were found.
+
+### 15. Profiles Went Stale After a Restart or a Monitor Reorder
+- **Symptom (caught in review, before it shipped)**: the stored profile's counter/monitor could lag the live config, so killing the app (rather than switching profiles) lost numbering; and if Windows reordered monitor indices between runs, a profile silently pointed at the wrong screen.
+- **Cause**: the live `AppConfig` is the source of truth for the active profile, and the profile copy was only refreshed on a profile *switch*. Profiles also stored the monitor's name but only ever used its index.
+- **How shotGun Handles This**: `sync_active_profile` writes live → profile after every capture, session start/end, monitor change and in `on_exit`. At startup `reconcile_monitors` re-points each profile's index by its remembered monitor name (a profile whose monitor is unplugged keeps its index unless it's out of range, then falls back to 0). Unit-tested (3 reconcile tests) and confirmed with real runs, including a relaunch continuing at the next file number.
+
+### 16. The Recording Border Must Never Be Recorded
+- **Risk**: an always-on-top border around the recorded area is, by construction, over the very pixels being recorded. If it leaked into DXGI frames the video would have a red frame baked in.
+- **How shotGun Handles This**: each of the four border windows (`src/rec_border.rs`) is marked `WDA_EXCLUDEFROMCAPTURE` *before* `ShowWindow`, so not even one frame can contain it, and if that call fails the border is simply not shown. They are also `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` (click-through, never steals focus, no taskbar button). **How it was verified**: a test grabs a DXGI frame with the exclusion off (border must be visible — the control, so the test can't pass vacuously) and on (border must be absent), and a live recording's first frame was checked for red at every edge.
 
 ---
 
