@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](https://microsoft.com/windows)
-[![Version](https://img.shields.io/badge/version-0.3.0-brightgreen.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.4.0-brightgreen.svg)](Cargo.toml)
 
 ---
 
@@ -17,7 +17,10 @@
 
 ---
 
-## 🌟 Key Features (v0.3.0)
+## 🌟 Key Features (v0.4.0)
+
+- 🗂️ **Capture Profiles**: Named, switchable capture setups — e.g. a "Teams" profile with its own region/output folder/filename prefix, and a separate "Video Recording" profile with its own monitor/fps/output — switch between them with one click instead of re-pointing settings every time.
+- 🖌️ **Post-Capture Annotation Editor**: After a Quick Region Capture, annotate directly on the frozen overlay before saving — Arrow, Rectangle, Highlighter, Text, Blur/Pixelate (adjustable strength), Redact (solid opaque), and numbered Step Labels, with a color picker and full undo.
 
 - 🖥️ **Multi-Monitor Support**: Automatically detects all connected displays, resolutions, positions, scale factors, and primary status.
 - ✂️ **Interactive Drag-Select Overlay**: Freeze the screen and drag a bounding box with live pixel dimension badges and coordinates to define your ROI.

@@ -10,6 +10,7 @@ mod dxgi_capture;
 mod hotkey;
 mod overlay;
 mod pdf_export;
+mod profiles;
 mod tray;
 mod video;
 

@@ -8,6 +8,7 @@ use crate::hotkey::{
 };
 use crate::overlay::{OverlayAction, RegionSelectorOverlay};
 use crate::pdf_export;
+use crate::profiles::{CaptureProfile, ProfileKind, ProfilesFile};
 use crate::tray::{TrayAction, TrayHandler};
 use crate::video;
 use crossbeam_channel::Receiver;
@@ -98,6 +99,42 @@ pub struct ShotgunApp {
     /// Async PDF export in flight, if any: (label to prefix the status
     /// message with once done, receiver for the result).
     pub pdf_export_rx: Option<(String, Receiver<Result<PathBuf, String>>)>,
+    /// Set when the user asked to exit (native close button or tray Exit)
+    /// while a video encode or PDF export was still in flight — closing
+    /// then would kill the worker thread mid-write and can corrupt the
+    /// output file. The actual `ViewportCommand::Close` is deferred until
+    /// both `video_encoding` is false and `pdf_export_rx` is `None`.
+    pub pending_exit: bool,
+    /// An exit that's already been vetted (tray Exit, or a deferred exit
+    /// whose encode/export has now finished) and must not be intercepted
+    /// again by `handle_close_request` — otherwise, with `close_to_tray` on,
+    /// the `Close` we send would itself be turned back into a minimize and
+    /// an explicit "Exit" would never actually exit.
+    pub exit_confirmed: bool,
+
+    // Capture Profiles
+    pub profiles: ProfilesFile,
+    pub profile_manager_open: bool,
+    /// Which profile the manager window's editor panel is currently showing.
+    pub profile_editing_id: Option<String>,
+    /// Set while the profile editor's own "🎯 Drag-Select Region" button
+    /// has kicked off an overlay session — on `OverlayAction::Confirmed`,
+    /// the region is written into *this* profile (by id) instead of (only)
+    /// the live config. Distinct from the manual Screen-tab button and the
+    /// Quick Capture flow, neither of which touch this.
+    pub profile_region_picker_target: Option<String>,
+    /// The live config's monitor_index from just before the profile
+    /// editor's region picker temporarily pointed it at the
+    /// profile-under-edit's monitor — restored once the picker resolves,
+    /// so editing a non-active profile's region doesn't leave the actually
+    /// active profile's monitor selection silently overwritten.
+    pub profile_region_picker_prev_monitor: Option<usize>,
+    /// Text buffer for the manager window's "+ New Profile" name field.
+    pub profile_new_name: String,
+    /// Profile awaiting delete confirmation in the manager window —
+    /// deleting is destructive, so the trash button only arms this and a
+    /// separate explicit "Yes, delete" click actually removes it.
+    pub profile_pending_delete: Option<String>,
 
     // Interactive Session Reset Modal State
     pub session_modal_open: bool,
@@ -121,6 +158,18 @@ impl ShotgunApp {
 
         let config = AppConfig::load();
         let monitors = get_monitors();
+
+        // Loads profiles.json, or (first run after upgrading) creates it
+        // with a single "Default" profile snapshotting whatever config.json
+        // already had — zero disruption for anyone who never opens the
+        // Profiles UI. Never applied back onto `config` here: config.json
+        // is already the authoritative live state for whichever profile
+        // was active when the app last closed.
+        let active_monitor_name = monitors
+            .get(config.monitor_index)
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        let profiles = ProfilesFile::load_or_migrate(&config, active_monitor_name);
 
         // Determine initial UI indices for hotkeys
         let temp_capture_key_idx = AVAILABLE_KEYS
@@ -200,6 +249,15 @@ impl ShotgunApp {
             video_encoding: false,
             recording_started_at: None,
             pdf_export_rx: None,
+            pending_exit: false,
+            exit_confirmed: false,
+            profiles,
+            profile_manager_open: false,
+            profile_editing_id: None,
+            profile_region_picker_target: None,
+            profile_region_picker_prev_monitor: None,
+            profile_new_name: String::new(),
+            profile_pending_delete: None,
             // session modal state
             session_modal_open: false,
             temp_session_name,
@@ -549,6 +607,23 @@ impl ShotgunApp {
     /// can recreate the native window when decorations are toggled, and a
     /// position/size command sent in the same batch as that toggle is prone
     /// to being silently dropped mid-recreation.
+    /// Entry point for the profile editor's "🎯 Drag-Select Region" button:
+    /// same freeze-overlay mechanism as the plain Screen-tab button
+    /// (`annotate_after_select=false` — no annotate step here either), but
+    /// targets whichever monitor `profile_id`'s profile currently has
+    /// selected, and on confirm writes the region into *that profile*
+    /// rather than the live config. See the `OverlayAction::Confirmed`
+    /// handling in `update()` for the other half of this.
+    fn start_profile_region_picker(&mut self, ctx: &Context, profile_id: &str) {
+        let Some(profile_monitor) = self.profiles.find(profile_id).map(|p| p.monitor_index) else {
+            return;
+        };
+        self.profile_region_picker_target = Some(profile_id.to_string());
+        self.profile_region_picker_prev_monitor = Some(self.config.monitor_index);
+        self.config.monitor_index = profile_monitor;
+        self.start_drag_select_overlay(ctx);
+    }
+
     fn start_drag_select_overlay(&mut self, ctx: &Context) {
         if self.monitors.get(self.config.monitor_index).is_none() {
             self.status_message = "No monitor available to select on.".to_string();
@@ -753,6 +828,61 @@ impl ShotgunApp {
         }
     }
 
+    /// Handles the native window close request (the title bar ✕ button).
+    /// Two independent reasons to intercept it rather than let it proceed:
+    ///
+    /// 1. A video encode or PDF export in flight — closing kills that
+    ///    worker thread mid-write and can corrupt the output file,
+    ///    regardless of `close_to_tray`. Deferred via `pending_exit`; see
+    ///    the check in `update()` after the async polls.
+    /// 2. `close_to_tray` is on — the ✕ button should minimize to tray
+    ///    instead of exiting, the same as `minimize_to_tray` does for the
+    ///    actual minimize button, using the same `WS_EX_TOOLWINDOW`
+    ///    mechanism (never `ViewportCommand::Visible`, see BUGS.md #8).
+    ///
+    /// Either way, `ViewportCommand::CancelClose` stops the close from
+    /// actually happening this frame; a later close attempt (another ✕
+    /// click) generates a fresh close-requested event to react to again.
+    fn handle_close_request(&mut self, ctx: &Context, frame: &eframe::Frame) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+
+        // An exit that's already been vetted (tray Exit, or a deferred exit
+        // whose encode/export has since finished) — let it through as-is.
+        // Without this, with `close_to_tray` on, the `Close` we send would
+        // be intercepted below and turned back into a minimize.
+        if self.exit_confirmed {
+            return;
+        }
+
+        // ✕ with close_to_tray on never exits the app, so it's safe even
+        // mid-encode — just minimize. (Checked before the in-flight-work
+        // guard below for exactly that reason: that guard exists to stop
+        // an *exit* from killing a worker thread, which this isn't.)
+        if self.config.close_to_tray {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.window_visible = false;
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            Self::set_taskbar_button_visible(frame, false);
+            // Pre-empt maybe_toggle_taskbar_for_minimize's own transition
+            // detection next frame — we've already hidden the taskbar
+            // button ourselves, so its `is_minimized == was_minimized`
+            // check should see them already matching and no-op.
+            self.was_minimized = true;
+            self.status_message = "Minimized to tray.".to_string();
+            return;
+        }
+
+        if self.video_encoding || self.pdf_export_rx.is_some() {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.pending_exit = true;
+            self.status_message = "⏳ Waiting for video encode / PDF export to finish before exiting...".to_string();
+        }
+        // Otherwise: close_to_tray is off and nothing's in flight — don't
+        // send CancelClose, let the close proceed normally.
+    }
+
     /// Adds or removes `WS_EX_TOOLWINDOW` on the app's native window,
     /// which controls whether it has a taskbar button. Silently does
     /// nothing if the raw window handle isn't available (e.g. non-Win32
@@ -790,6 +920,95 @@ impl ShotgunApp {
             self.config.monitor_index = 0;
             let _ = self.config.save();
         }
+    }
+
+    /// Switches the active capture profile: writes the current live
+    /// settings back into whichever profile was active before switching
+    /// (so nothing typed is lost), then loads `target_id`'s saved values
+    /// into the live config. `do_capture()`/`start_video()`/etc. keep
+    /// reading the same flat `AppConfig` fields as always — only *which*
+    /// profile's values are currently loaded into them changes.
+    pub fn switch_to_profile(&mut self, target_id: &str) {
+        if self.profiles.active_profile_id.as_deref() == Some(target_id) {
+            return;
+        }
+        if let Some(active) = self.profiles.active_mut() {
+            active.update_from_config(&self.config);
+        }
+        let _ = self.profiles.save();
+
+        let Some(target) = self.profiles.find_mut(target_id) else {
+            self.status_message = format!("Profile not found: {target_id}");
+            return;
+        };
+        target.write_into_config(&mut self.config);
+        let target_name = target.name.clone();
+
+        self.profiles.active_profile_id = Some(target_id.to_string());
+        let _ = self.profiles.save();
+        let _ = self.config.save();
+        self.status_message = format!("📂 Switched to profile: {target_name}");
+    }
+
+    /// Creates a new profile snapshotting the *current* live settings (so
+    /// if you're already looking at what you want, naming it is all that's
+    /// needed), then switches to it.
+    pub fn create_profile(&mut self, name: String, kind: ProfileKind) {
+        let name = if name.trim().is_empty() { "New Profile".to_string() } else { name.trim().to_string() };
+        let id = self.profiles.unique_id_from_name(&name);
+        let monitor_name = self.monitors.get(self.config.monitor_index).map(|m| m.name.clone()).unwrap_or_default();
+
+        // Write back the currently-active profile first, same as a normal
+        // switch, before adding and switching to the new one.
+        if let Some(active) = self.profiles.active_mut() {
+            active.update_from_config(&self.config);
+        }
+        let profile = CaptureProfile::from_config(&self.config, id.clone(), name.clone(), kind, monitor_name);
+        self.profiles.profiles.push(profile);
+        self.profiles.active_profile_id = Some(id.clone());
+        let _ = self.profiles.save();
+        self.profile_editing_id = Some(id);
+        self.status_message = format!("📂 Created profile: {name}");
+    }
+
+    /// Duplicates an existing profile (new id/name, same settings) without
+    /// switching to it — opens the editor on the new copy so it can be
+    /// tweaked immediately.
+    pub fn duplicate_profile(&mut self, source_id: &str) {
+        let Some(source) = self.profiles.find(source_id) else {
+            return;
+        };
+        let mut copy = source.clone();
+        copy.name = format!("{} (copy)", source.name);
+        copy.id = self.profiles.unique_id_from_name(&copy.name);
+        let new_id = copy.id.clone();
+        self.profiles.profiles.push(copy);
+        let _ = self.profiles.save();
+        self.profile_editing_id = Some(new_id);
+    }
+
+    /// Deletes a profile. Refuses to delete the last remaining one (a
+    /// profile-less app has nowhere to keep the current settings tracked).
+    /// If the deleted profile was active, switches to whichever profile is
+    /// now first in the list.
+    pub fn delete_profile(&mut self, id: &str) {
+        if self.profiles.profiles.len() <= 1 {
+            self.status_message = "Can't delete the only remaining profile.".to_string();
+            return;
+        }
+        let was_active = self.profiles.active_profile_id.as_deref() == Some(id);
+        self.profiles.profiles.retain(|p| p.id != id);
+        if self.profile_editing_id.as_deref() == Some(id) {
+            self.profile_editing_id = None;
+        }
+        if was_active {
+            self.profiles.active_profile_id = None;
+            if let Some(first_id) = self.profiles.profiles.first().map(|p| p.id.clone()) {
+                self.switch_to_profile(&first_id);
+                return; // switch_to_profile already saves
+            }
+        }
+        let _ = self.profiles.save();
     }
 
     pub fn apply_hotkeys(&mut self) {
@@ -878,6 +1097,7 @@ impl eframe::App for ShotgunApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
         self.maybe_toggle_taskbar_for_minimize(ctx, frame);
+        self.handle_close_request(ctx, frame);
 
         // 1. Process System Tray Events
         if let Some(tray) = &self.tray_handler {
@@ -893,7 +1113,13 @@ impl eframe::App for ShotgunApp {
                         self.trigger_new_session(ctx);
                     }
                     TrayAction::ExitApp => {
-                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                        if self.video_encoding || self.pdf_export_rx.is_some() {
+                            self.pending_exit = true;
+                            self.status_message = "⏳ Waiting for video encode / PDF export to finish before exiting...".to_string();
+                        } else {
+                            self.exit_confirmed = true;
+                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                        }
                     }
                 }
             }
@@ -946,20 +1172,64 @@ impl eframe::App for ShotgunApp {
         self.poll_video_result();
         self.poll_pdf_export_result();
 
+        // A close/exit was requested while one of those was in flight
+        // (see `handle_close_request` / `TrayAction::ExitApp`) — now that
+        // both have had a chance to finish, let it through.
+        if self.pending_exit && !self.video_encoding && self.pdf_export_rx.is_none() {
+            self.pending_exit = false;
+            self.exit_confirmed = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+
         // 4. Render Full-Screen Snipping Overlay if Active
         match self.overlay.show(ctx) {
             OverlayAction::Confirmed(region) => {
-                self.config.region = Some(region);
-                let _ = self.config.save();
-                self.status_message = format!(
-                    "🎯 Region selected: X={}, Y={}, {}x{} px",
-                    region.x, region.y, region.width, region.height
-                );
+                if let Some(profile_id) = self.profile_region_picker_target.take() {
+                    // Came from the profile editor's own "Drag-Select
+                    // Region" button — write into that profile specifically,
+                    // not the live config, and restore whichever monitor
+                    // was actually live before the picker borrowed it.
+                    let monitor_index = self.config.monitor_index;
+                    let is_active = self.profiles.active_profile_id.as_deref() == Some(profile_id.as_str());
+                    if let Some(profile) = self.profiles.find_mut(&profile_id) {
+                        profile.region = Some(region);
+                        profile.monitor_index = monitor_index;
+                        let _ = self.profiles.save();
+                    }
+                    let prev_monitor = self.profile_region_picker_prev_monitor.take();
+                    if is_active {
+                        // The active profile *is* the live config — carry
+                        // the new region/monitor over (the picker already
+                        // pointed `config.monitor_index` at it), rather
+                        // than reverting to the pre-picker monitor.
+                        self.config.region = Some(region);
+                        self.config.monitor_index = monitor_index;
+                        let _ = self.config.save();
+                    } else if let Some(prev) = prev_monitor {
+                        self.config.monitor_index = prev;
+                    }
+                    self.status_message = format!(
+                        "🎯 Region set for profile: X={}, Y={}, {}x{} px",
+                        region.x, region.y, region.width, region.height
+                    );
+                } else {
+                    self.config.region = Some(region);
+                    let _ = self.config.save();
+                    self.status_message = format!(
+                        "🎯 Region selected: X={}, Y={}, {}x{} px",
+                        region.x, region.y, region.width, region.height
+                    );
+                }
                 self.restore_window_after_overlay(ctx);
             }
             OverlayAction::Cancelled => {
                 self.status_message = "Selection cancelled.".to_string();
                 self.pending_quick_capture = false;
+                if self.profile_region_picker_target.take().is_some() {
+                    if let Some(prev) = self.profile_region_picker_prev_monitor.take() {
+                        self.config.monitor_index = prev;
+                    }
+                }
                 self.restore_window_after_overlay(ctx);
             }
             OverlayAction::Annotated { image, region, explicit_copy } => {
@@ -984,7 +1254,7 @@ impl eframe::App for ShotgunApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("🎯 shotGun").size(17.0).strong().color(Color32::from_rgb(0, 220, 255)));
-                ui.label(RichText::new("v0.3.0").size(11.0).color(Color32::GRAY));
+                ui.label(RichText::new("v0.4.0").size(11.0).color(Color32::GRAY));
 
                 ui.separator();
 
@@ -1063,6 +1333,10 @@ impl eframe::App for ShotgunApp {
                         None => "Full Screen".to_string(),
                     };
                     ui.label(RichText::new(format!("{mon_name} | {reg_str}")).size(11.0).color(Color32::GRAY));
+                    if let Some(active) = self.profiles.active() {
+                        ui.label(RichText::new(format!("📂 {}", active.name)).size(11.0).color(Color32::from_rgb(0, 220, 255)));
+                        ui.separator();
+                    }
                 });
             });
             ui.add_space(2.0);
@@ -1082,7 +1356,10 @@ impl eframe::App for ShotgunApp {
             });
         });
 
-        // 8. Interactive Session Reset Modal
+        // 8. Manage Profiles Window
+        self.render_profile_manager_window(ctx);
+
+        // 9. Interactive Session Reset Modal
         if self.session_modal_open {
             egui::Window::new("🔄 Configure New Session")
                 .collapsible(false)
@@ -1135,7 +1412,310 @@ impl eframe::App for ShotgunApp {
 }
 
 impl ShotgunApp {
+    /// The row of profile "pills" shown at the top of the Screen tab —
+    /// click one to switch, "+ New" to create one from the current live
+    /// settings, "⚙ Manage" to open the full editor.
+    fn render_profile_pills(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Profile:");
+                let active_id = self.profiles.active_profile_id.clone();
+                let mut clicked: Option<String> = None;
+                for profile in &self.profiles.profiles {
+                    let is_active = active_id.as_deref() == Some(profile.id.as_str());
+                    let label = format!("{} {}", profile.kind.label(), profile.name);
+                    if ui.selectable_label(is_active, label).clicked() {
+                        clicked = Some(profile.id.clone());
+                    }
+                }
+                if let Some(id) = clicked {
+                    self.switch_to_profile(&id);
+                }
+
+                ui.separator();
+                if ui.button("➕ New").on_hover_text("Save the current Screen/Output settings as a new profile, then open it to set its region, folder, and file pattern").clicked() {
+                    self.create_profile(format!("Profile {}", self.profiles.profiles.len() + 1), ProfileKind::Screenshot);
+                    // Open the editor on it straight away — the point of a
+                    // new profile is to name it and set its region/folder/
+                    // file pattern, not to silently get a copy of the
+                    // current settings under a placeholder name.
+                    self.profile_manager_open = true;
+                }
+                if ui.button("⚙ Manage").clicked() {
+                    self.profile_manager_open = true;
+                    if self.profile_editing_id.is_none() {
+                        self.profile_editing_id = self.profiles.active_profile_id.clone();
+                    }
+                }
+            });
+        });
+    }
+
+    /// "⚙ Manage Profiles" window: a profile list (select/duplicate/delete,
+    /// create new) plus the full field editor for whichever profile is
+    /// currently selected in that list.
+    fn render_profile_manager_window(&mut self, ctx: &Context) {
+        if !self.profile_manager_open {
+            return;
+        }
+        let mut open = true;
+
+        egui::Window::new("🗂️ Manage Profiles")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([540.0, 520.0])
+            .show(ctx, |ui| {
+                ui.strong("Profiles:");
+                ui.add_space(4.0);
+
+                let active_id = self.profiles.active_profile_id.clone();
+                let mut select_id: Option<String> = None;
+                let mut duplicate_id: Option<String> = None;
+                let mut delete_id: Option<String> = None;
+
+                ScrollArea::vertical().max_height(140.0).id_salt("profile_manager_list").show(ui, |ui| {
+                    for profile in &self.profiles.profiles {
+                        ui.horizontal(|ui| {
+                            let is_editing = self.profile_editing_id.as_deref() == Some(profile.id.as_str());
+                            let is_active = active_id.as_deref() == Some(profile.id.as_str());
+                            let label = format!("{}{} {}", if is_active { "🔘 " } else { "⚪ " }, profile.kind.label(), profile.name);
+                            if ui.selectable_label(is_editing, label).clicked() {
+                                select_id = Some(profile.id.clone());
+                            }
+                            if ui.small_button("⧉").on_hover_text("Duplicate").clicked() {
+                                duplicate_id = Some(profile.id.clone());
+                            }
+                            if ui.small_button("🗑").on_hover_text("Delete (asks to confirm)").clicked() {
+                                delete_id = Some(profile.id.clone());
+                            }
+                        });
+                    }
+                });
+                if let Some(id) = select_id {
+                    self.profile_editing_id = Some(id);
+                }
+                if let Some(id) = duplicate_id {
+                    self.duplicate_profile(&id);
+                }
+                // Deleting is destructive — the trash button only arms a
+                // confirmation; the actual delete needs a second click.
+                if let Some(id) = delete_id {
+                    self.profile_pending_delete = Some(id);
+                }
+                if let Some(pending_id) = self.profile_pending_delete.clone() {
+                    let name = self.profiles.find(&pending_id).map(|p| p.name.clone()).unwrap_or_default();
+                    let mut confirmed = false;
+                    let mut cancelled = false;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Delete profile \"{name}\"?")).color(Color32::from_rgb(255, 120, 120)));
+                        if ui.button("Yes, delete").clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                    if confirmed {
+                        self.delete_profile(&pending_id);
+                        self.profile_pending_delete = None;
+                    } else if cancelled {
+                        self.profile_pending_delete = None;
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("New profile name:");
+                    ui.text_edit_singleline(&mut self.profile_new_name);
+                    if ui.button("📸 New Screenshot Profile").clicked() {
+                        let name = std::mem::take(&mut self.profile_new_name);
+                        self.create_profile(name, ProfileKind::Screenshot);
+                    }
+                    if ui.button("🎬 New Video Profile").clicked() {
+                        let name = std::mem::take(&mut self.profile_new_name);
+                        self.create_profile(name, ProfileKind::Video);
+                    }
+                });
+
+                ui.separator();
+
+                if let Some(editing_id) = self.profile_editing_id.clone() {
+                    self.render_profile_editor_fields(ui, ctx, &editing_id);
+                } else {
+                    ui.label(RichText::new("Select a profile above to edit it.").color(Color32::GRAY));
+                }
+            });
+
+        self.profile_manager_open = open;
+    }
+
+    /// The actual field editor for one profile, used inside the Manage
+    /// Profiles window. `self.monitors` is cloned up front so it can be
+    /// read (for the monitor picker) at the same time `self.profiles` is
+    /// mutably borrowed (to edit the profile's fields) — these are
+    /// disjoint fields on `self`, but going through the `find_mut` method
+    /// borrows all of `self.profiles`, so cloning the small monitor list
+    /// sidesteps needing the borrow checker to see through that.
+    fn render_profile_editor_fields(&mut self, ui: &mut Ui, ctx: &Context, editing_id: &str) {
+        let monitors = self.monitors.clone();
+        let mut want_drag_select = false;
+        let is_active = self.profiles.active_profile_id.as_deref() == Some(editing_id);
+
+        let Some(profile) = self.profiles.find_mut(editing_id) else {
+            self.profile_editing_id = None;
+            return;
+        };
+        // For the *active* profile, the live config is the source of truth
+        // between edits (captures advance `counter`/`session_index` there,
+        // not in the stored profile). Pull those in first, so the
+        // write-through below at the end of this function can't roll them
+        // back to whatever the profile last saw.
+        if is_active {
+            profile.update_from_config(&self.config);
+        }
+        let mut changed = false;
+
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            changed |= ui.text_edit_singleline(&mut profile.name).changed();
+        });
+        ui.label(format!("Type: {} (fixed at creation — duplicate to change)", profile.kind.label()));
+
+        ui.add_space(6.0);
+        ui.strong("Monitor:");
+        for (idx, mon) in monitors.iter().enumerate() {
+            let is_selected = profile.monitor_index == idx;
+            let label = format!("{} {} - {}x{}", if is_selected { "🔘" } else { "⚪" }, mon.name, mon.width, mon.height);
+            if ui.selectable_label(is_selected, label).clicked() {
+                profile.monitor_index = idx;
+                profile.monitor_name = mon.name.clone();
+                changed = true;
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.strong("Region:");
+        ui.horizontal(|ui| {
+            if ui.selectable_label(profile.region.is_none(), "🖥️ Full Screen").clicked() {
+                profile.region = None;
+                changed = true;
+            }
+            if ui.selectable_label(profile.region.is_some(), "✂️ Custom Region").clicked() && profile.region.is_none() {
+                if let Some(mon) = monitors.get(profile.monitor_index) {
+                    profile.region = Some(RectRegion { x: 0, y: 0, width: mon.width, height: mon.height });
+                    changed = true;
+                }
+            }
+            if ui.button("🎯 Drag-Select Region").on_hover_text("Freezes the profile's monitor to draw a precise region").clicked() {
+                want_drag_select = true;
+            }
+        });
+        if let Some(mut r) = profile.region {
+            ui.horizontal(|ui| {
+                ui.label("X:");
+                changed |= ui.add(egui::DragValue::new(&mut r.x).range(0..=10000)).changed();
+                ui.label("Y:");
+                changed |= ui.add(egui::DragValue::new(&mut r.y).range(0..=10000)).changed();
+                ui.label("W:");
+                changed |= ui.add(egui::DragValue::new(&mut r.width).range(1..=10000)).changed();
+                ui.label("H:");
+                changed |= ui.add(egui::DragValue::new(&mut r.height).range(1..=10000)).changed();
+            });
+            profile.region = Some(r);
+        }
+
+        ui.add_space(6.0);
+        ui.strong("Output:");
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(profile.output_dir.to_string_lossy()).monospace().size(11.0));
+            if ui.button("📂 Browse...").clicked() {
+                if let Some(folder) = rfd::FileDialog::new().set_directory(&profile.output_dir).pick_folder() {
+                    profile.output_dir = folder;
+                    changed = true;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("File Prefix:");
+            changed |= ui.text_edit_singleline(&mut profile.file_prefix).changed();
+            ui.label("Digits:");
+            changed |= ui.add(egui::DragValue::new(&mut profile.padding_digits).range(1..=8)).changed();
+        });
+        let preview_ext = match profile.kind {
+            ProfileKind::Screenshot => profile.format.extension().to_string(),
+            ProfileKind::Video => "mp4".to_string(),
+        };
+        ui.label(
+            RichText::new(format!(
+                "Next Output: {}{:0width$}.{}",
+                profile.file_prefix, profile.counter, preview_ext, width = profile.padding_digits
+            ))
+            .color(Color32::GRAY)
+            .size(10.5),
+        );
+
+        ui.add_space(6.0);
+        match profile.kind {
+            ProfileKind::Screenshot => {
+                ui.strong("Format:");
+                ui.horizontal(|ui| {
+                    for fmt in OutputFormat::ALL {
+                        if ui.selectable_value(&mut profile.format, fmt, fmt.extension().to_uppercase()).clicked() {
+                            changed = true;
+                        }
+                    }
+                });
+                if profile.format == OutputFormat::Jpeg {
+                    ui.horizontal(|ui| {
+                        ui.label("Quality:");
+                        changed |= ui.add(egui::Slider::new(&mut profile.jpeg_quality, 1..=100).text("%")).changed();
+                    });
+                }
+            }
+            ProfileKind::Video => {
+                ui.strong("Video:");
+                ui.horizontal(|ui| {
+                    ui.label("Target FPS:");
+                    changed |= ui.add(egui::DragValue::new(&mut profile.video_fps).range(1..=60)).changed();
+                });
+                changed |= ui.checkbox(&mut profile.cleanup_video_frames_after_encode, "Delete intermediate frames/audio after encode").changed();
+            }
+        }
+
+        ui.add_space(6.0);
+        changed |= ui.checkbox(&mut profile.auto_copy_to_clipboard, "Automatically copy to clipboard on capture").changed();
+        changed |= ui.checkbox(&mut profile.auto_export_pdf_on_session, "Automatically bundle into a PDF on New Session").changed();
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Session Prefix:");
+            changed |= ui.text_edit_singleline(&mut profile.session_prefix).changed();
+            changed |= ui.checkbox(&mut profile.use_session_subfolders, "Use session subfolders").changed();
+        });
+
+        if changed {
+            // Editing the *active* profile has to reach the live config too:
+            // captures read `self.config`, not the stored profile, and the
+            // next profile switch writes the live config back over the
+            // profile — so without this, the edits would both do nothing
+            // and then be silently overwritten and lost.
+            if is_active {
+                profile.write_into_config(&mut self.config);
+                let _ = self.config.save();
+            }
+            let _ = self.profiles.save();
+        }
+
+        if want_drag_select {
+            self.start_profile_region_picker(ctx, editing_id);
+        }
+    }
+
     fn render_screen_region_tab(&mut self, ui: &mut Ui, ctx: &Context) {
+        self.render_profile_pills(ui);
+        ui.add_space(6.0);
+
         ui.heading("🖥️ Display & Region of Interest (ROI)");
         ui.add_space(4.0);
 
@@ -1645,6 +2225,15 @@ impl ShotgunApp {
                 let _ = self.config.save();
             }
 
+            if ui.checkbox(&mut self.config.close_to_tray, "Closing the window (✕) also goes to tray, instead of exiting").changed() {
+                let _ = self.config.save();
+            }
+            ui.label(
+                RichText::new("Separate from the setting above: this changes what the title bar's ✕ button does. Use the tray icon's \"Exit shotGun\" (or the Show/Hide hotkey, then Exit) to actually quit.")
+                    .size(10.5)
+                    .color(Color32::GRAY),
+            );
+
             if ui.checkbox(&mut self.config.play_sound, "Play audio chime on capture").changed() {
                 let _ = self.config.save();
             }
@@ -1791,7 +2380,7 @@ impl ShotgunApp {
     }
 
     fn render_about_tab(&mut self, ui: &mut Ui) {
-        ui.heading("🎯 shotGun v0.3.0");
+        ui.heading("🎯 shotGun v0.4.0");
         ui.label(RichText::new("Created by Noerotech").size(14.0).strong().color(Color32::from_rgb(0, 220, 255)));
         ui.add_space(6.0);
 
@@ -1809,6 +2398,8 @@ impl ShotgunApp {
             ui.label("• PNG, JPEG, BMP, and WebP Encoders");
             ui.label("• Video Recording (DXGI Desktop Duplication) with WASAPI Loopback Audio");
             ui.label("• Multi-Screenshot PDF Export (manual or auto per session)");
+            ui.label("• Post-Capture Annotation Editor (Arrow, Rectangle, Highlighter, Text, Blur, Redact, Step Labels)");
+            ui.label("• Capture Profiles: named, switchable region/output/naming setups");
             ui.label("• Compact & Responsive UI");
         });
 

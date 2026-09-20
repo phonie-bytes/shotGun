@@ -668,6 +668,7 @@ pub fn start_from_global(config: &AppConfig) -> (VideoHandle, Receiver<VideoResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// Not a correctness check — measures how long PNG-encoding a realistic
     /// frame takes with default settings (Adaptive filter) vs a fast filter,
@@ -725,7 +726,16 @@ mod tests {
             cleanup_after_encode: false,
         };
         let (handle, result_rx) = start_video_capture(cfg);
-        std::thread::sleep(Duration::from_secs(2));
+        // DXGI Desktop Duplication only delivers a frame when the desktop
+        // actually repaints something — a genuinely static screen for the
+        // whole window produces zero frames, which isn't a bug, just an
+        // environmental dependency these tests can't fully control (no
+        // window-creation/painting trick is worth the risk of visibly
+        // flickering the real, possibly-in-use desktop just to force one).
+        // 5s rather than 2s meaningfully raises the odds of catching
+        // *something* — a blinking caret, a clock tick, a background app —
+        // without eliminating the dependency outright.
+        std::thread::sleep(Duration::from_secs(5));
         handle.stop();
 
         let result = result_rx.recv().expect("no result from video capture");
@@ -738,7 +748,14 @@ mod tests {
         }
     }
 
+    // DXGI Desktop Duplication only allows one active duplication session
+    // per monitor per process; these tests all open one, and running them
+    // concurrently (the default with `cargo test`) lets Windows fail one
+    // session out from under another. #[serial] forces them to run one at
+    // a time relative to each other without affecting the rest of the
+    // suite's parallelism.
     #[test]
+    #[serial]
     fn dxgi_capture_produces_multiple_frames() {
         let dir = std::env::temp_dir().join("shotgun_video_test_1");
         let _ = std::fs::remove_dir_all(&dir);
@@ -760,6 +777,7 @@ mod tests {
     /// session without releasing the first. `get_or_create_recorder` fixes
     /// this by reusing one persistent session across recordings.
     #[test]
+    #[serial]
     fn second_recording_in_same_process_still_captures_frames() {
         let dir_a = std::env::temp_dir().join("shotgun_video_test_2a");
         let dir_b = std::env::temp_dir().join("shotgun_video_test_2b");
@@ -784,6 +802,7 @@ mod tests {
     /// fails with DXGI_ERROR_NOT_FOUND. This exercises every monitor xcap
     /// reports, to catch that regardless of which adapter each is on.
     #[test]
+    #[serial]
     fn every_monitor_captures_at_least_one_frame() {
         let monitor_count = Monitor::all().map(|m| m.len()).unwrap_or(0);
         assert!(monitor_count >= 1, "expected at least one monitor to be detected");
@@ -805,6 +824,7 @@ mod tests {
     /// (e.g. the user's real 2701x1541 region), which used to make ffmpeg
     /// fail outright and write a 0-byte file despite frames capturing fine.
     #[test]
+    #[serial]
     fn odd_dimension_region_still_encodes_to_a_playable_mp4() {
         let ffmpeg_path = "R:\\repos\\ai-testing\\TainGester\\convert\\ffmpeg\\bin\\ffmpeg.exe";
         if !std::path::Path::new(ffmpeg_path).exists() {
@@ -826,7 +846,7 @@ mod tests {
             cleanup_after_encode: false,
         };
         let (handle, result_rx) = start_video_capture(cfg);
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_secs(5));
         handle.stop();
 
         let result = result_rx.recv().expect("no result from video capture");
